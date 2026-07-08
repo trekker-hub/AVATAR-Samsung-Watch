@@ -24,4 +24,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "GalaxyWatch5"
 include(":app")
+include(":mobile")
  

@@ -35,6 +35,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.google.android.gms.wearable.Wearable
+import java.io.File
 import com.samsung.android.service.health.tracking.ConnectionListener
 import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.HealthTrackerException
@@ -51,21 +53,42 @@ class MainActivity : ComponentActivity() {
     private data class SensorOption(
         val label: String,
         val type: HealthTrackerType,
-        val ppgTypes: Set<PpgType>? = null,   // only for PPG trackers
-        val onDemand: Boolean = false          // single ~30 s measurement, auto-stops
+        val ppgTypes: Set<PpgType>? = null,     // only for PPG trackers
+        val onDemand: Boolean = false,          // single measurement, auto-stops
+        val expectedSeconds: Int? = null,       // rough duration hint (null = continuous)
+        val hint: String? = null,               // on-screen instruction (e.g. hold a button)
+        val doneOnTimeout: Boolean = false      // true: timer expiry IS success (ECG/PPG capture),
+                                                 // false: timer expiry means it never completed
     )
 
     // Candidate options; the menu only shows the ones the watch reports as supported.
+    // On a Watch 8 you should see all of these; on a Watch 5, EDA and MF-BIA are hidden
+    // automatically because the hardware doesn't report them.
     private val candidates = listOf(
         SensorOption("Heart Rate", HealthTrackerType.HEART_RATE_CONTINUOUS),
         SensorOption("Accelerometer", HealthTrackerType.ACCELEROMETER_CONTINUOUS),
         SensorOption("PPG Green", HealthTrackerType.PPG_CONTINUOUS, setOf(PpgType.GREEN)),
-        SensorOption("PPG IR + Red (30s)", HealthTrackerType.PPG_ON_DEMAND,
-            setOf(PpgType.IR, PpgType.RED), onDemand = true),
-        SensorOption("SpO2 (30s)", HealthTrackerType.SPO2_ON_DEMAND, onDemand = true),
+        // EDA — the AVATAR stress/craving signal. Watch 8 only; continuous stream.
+        SensorOption("EDA (skin conductance)", HealthTrackerType.EDA_CONTINUOUS,
+            hint = "Wear snug, rest your arm and sit still"),
+        SensorOption("PPG IR + Red (~30s)", HealthTrackerType.PPG_ON_DEMAND,
+            setOf(PpgType.IR, PpgType.RED), onDemand = true,
+            expectedSeconds = 30, hint = "Hold still", doneOnTimeout = true),
+        SensorOption("SpO2 (~30s)", HealthTrackerType.SPO2_ON_DEMAND, onDemand = true,
+            expectedSeconds = 30, hint = "Hold arm still and flat"),
+        SensorOption("ECG (~30s)", HealthTrackerType.ECG_ON_DEMAND, onDemand = true,
+            expectedSeconds = 30,
+            hint = "Press metal crown firmly with index fingertip of other hand — stay still",
+            doneOnTimeout = true),
+        SensorOption("Body Comp / BIA (~15s)", HealthTrackerType.BIA_ON_DEMAND, onDemand = true,
+            expectedSeconds = 15,
+            hint = "Place index + middle finger of free hand on the two metal rails on the watch frame"),
+        SensorOption("Multi-freq BIA (~15s)", HealthTrackerType.MF_BIA_ON_DEMAND, onDemand = true,
+            expectedSeconds = 15,
+            hint = "Place index + middle finger of free hand on the two metal rails on the watch frame"),
         SensorOption("Skin Temp", HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS),
-        SensorOption("Skin Temp (30s)", HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND,
-            onDemand = true),
+        SensorOption("Skin Temp (~5s)", HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND,
+            onDemand = true, expectedSeconds = 5),
     )
 
     // ---------- UI state ----------
@@ -80,7 +103,47 @@ class MainActivity : ComponentActivity() {
     private var healthService: HealthTrackingService? = null
     private var tracker: HealthTracker? = null
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val onDemandTimeout = Runnable { stopTracker("Timed out — check watch fit") }
+    private var measureStart = 0L   // SystemClock.elapsedRealtime() when tracking began
+    private var contactMade = false  // true once skin/finger contact is detected
+    private var packetCount = 0      // how many onDataReceived calls have fired
+    private var autoRunQueue: List<SensorOption> = emptyList()
+    private var autoRunIndex = -1    // -1 = not in auto-run
+    private var dataLogger: DataLogger? = null
+    // ECG removed: LEAD_OFF returns -1 on this firmware regardless of contact,
+    // so we can't gate the timer on it. BIA/MF_BIA still detect contact via PROGRESS.
+    private val contactRequiredTypes = setOf(
+        HealthTrackerType.BIA_ON_DEMAND,
+        HealthTrackerType.MF_BIA_ON_DEMAND
+    )
+
+    // Fires only if an on-demand sensor never reports completion.
+    private val onDemandTimeout = Runnable {
+        val opt = active
+        if (opt?.doneOnTimeout == true) stopTracker("Done — ${opt.expectedSeconds}s capture")
+        else stopTracker("Timed out — check watch fit / contact")
+    }
+
+    // In auto-run, caps continuous sensors at 30 s then advances to the next sensor.
+    private val autoAdvanceRunnable = Runnable { stopTracker("⏭ 30s done") }
+
+    // Repeats every second while a sensor is active, so the user can SEE it's alive
+    // (on-demand sensors otherwise show nothing for up to 30 s).
+    private val ticker = object : Runnable {
+        override fun run() {
+            val opt = active
+            if (opt == null || tracker == null) return
+            val secs = ((android.os.SystemClock.elapsedRealtime() - measureStart) / 1000).toInt()
+            readings[" status"] = when {
+                opt.type in contactRequiredTypes && !contactMade ->
+                    "👆 waiting for contact…"
+                opt.onDemand && opt.expectedSeconds != null ->
+                    "⏳ measuring · ${secs}s / ~${opt.expectedSeconds}s"
+                opt.onDemand -> "⏳ measuring · ${secs}s"
+                else -> "🟢 live · ${secs}s"
+            }
+            mainHandler.postDelayed(this, 1000L)
+        }
+    }
 
     private val requiredPermissions = arrayOf(
         Manifest.permission.BODY_SENSORS,
@@ -121,10 +184,12 @@ class MainActivity : ComponentActivity() {
             override fun onConnectionSuccess() {
                 val supported = healthService?.trackingCapability
                     ?.supportHealthTrackerTypes ?: emptyList()
+                // Q3: is ECG_ON_DEMAND explicitly in the supported list?
+                val ecgOk = HealthTrackerType.ECG_ON_DEMAND in supported
                 runOnUiThread {
                     menu.clear()
                     menu.addAll(candidates.filter { it.type in supported })
-                    connectionStatus = "Connected — pick a sensor"
+                    connectionStatus = "Connected (${supported.size} types, ECG_ON_DEMAND=$ecgOk)"
                 }
             }
             override fun onConnectionEnded() {
@@ -140,11 +205,26 @@ class MainActivity : ComponentActivity() {
     // ---------- Start / stop ----------
 
     private fun startTracker(option: SensorOption) {
-        stopTracker(null)  // safety: never two trackers at once
+        // Tear down any running tracker without touching auto-run state.
+        // (stopTracker(null) would reset autoRunIndex and break sequencing.)
+        mainHandler.removeCallbacks(onDemandTimeout)
+        mainHandler.removeCallbacks(ticker)
+        mainHandler.removeCallbacks(autoAdvanceRunnable)
+        tracker?.let { runCatching { it.unsetEventListener() } }
+        tracker = null
         val svc = healthService ?: return
+        // For individual manual taps (not part of auto-run), start a fresh session log
+        if (autoRunIndex < 0 && dataLogger == null) {
+            dataLogger = DataLogger(this, autoRun = false)
+        }
         readings.clear()
-        readings["status"] = if (option.onDemand) "measuring… hold still" else "waiting…"
+        option.hint?.let { readings[" info"] = it }
+        readings[" status"] = if (option.onDemand) "starting measurement…" else "connecting…"
         active = option
+        contactMade = false
+        packetCount = 0
+        measureStart = android.os.SystemClock.elapsedRealtime()
+        dataLogger?.event("sensor_start", option.label)
 
         try {
             tracker = if (option.ppgTypes != null)
@@ -154,39 +234,175 @@ class MainActivity : ComponentActivity() {
 
             tracker?.setEventListener(object : HealthTracker.TrackerEventListener {
                 override fun onDataReceived(dataPoints: List<DataPoint>) {
-                    val dp = dataPoints.lastOrNull() ?: return
                     runOnUiThread {
-                        readings.remove("status")
+                        packetCount++
+                        readings["[dbg] packets"] = "#$packetCount  list.size=${dataPoints.size}"
+                        val dp = dataPoints.lastOrNull() ?: return@runOnUiThread
                         format(option, dp)
-                        // On-demand: stop once we have a completed reading
+                        // Log full readings snapshot including all debug fields
+                        dataLogger?.log(option.label, readings.toMap())
                         if (option.onDemand && isOnDemandComplete(option, dp)) {
-                            stopTracker("Done")
+                            stopTracker("✅ Done")
                         }
                     }
                 }
                 override fun onFlushCompleted() {}
                 override fun onError(e: HealthTracker.TrackerError) {
+                    val msg = when (e) {
+                        HealthTracker.TrackerError.PERMISSION_ERROR ->
+                            "PERMISSION_ERROR — BODY_SENSORS / READ_HEART_RATE not granted at runtime"
+                        HealthTracker.TrackerError.SDK_POLICY_ERROR ->
+                            "SDK_POLICY_ERROR — ECG outside app scope; enable Health Platform dev mode"
+                        else -> "TrackerError: $e"
+                    }
                     runOnUiThread {
-                        readings["status"] = "error: $e"
-                        // SDK_POLICY_ERROR → enable Health Platform developer mode
+                        readings["[dbg] onError"] = msg
+                        dataLogger?.event("sdk_error", option.label, msg)
                     }
                 }
             })
 
-            if (option.onDemand) mainHandler.postDelayed(onDemandTimeout, 35_000L)
+            mainHandler.post(ticker)
+            // Contact-required sensors delay their timeout until finger/skin contact is detected
+            // (handled in format() when the first valid reading arrives)
+            if (option.onDemand && option.type !in contactRequiredTypes) {
+                val timeoutMs = ((option.expectedSeconds ?: 30) + 8) * 1000L
+                mainHandler.postDelayed(onDemandTimeout, timeoutMs)
+            }
         } catch (e: HealthTrackerException) {
-            readings["status"] = "err ${e.errorCode}"
+            dataLogger?.event("init_error", option.label, "HealthTrackerException ${e.errorCode}")
+            stopTracker("err ${e.errorCode}")
+        } catch (e: IllegalArgumentException) {
+            val isBia = option.type == HealthTrackerType.BIA_ON_DEMAND ||
+                        option.type == HealthTrackerType.MF_BIA_ON_DEMAND
+            val msg = if (isBia)
+                "BIA needs profile: open Samsung Health → Profile → set age/height/weight/sex"
+            else "IllegalArgumentException"
+            dataLogger?.event("init_error", option.label, msg)
+            stopTracker(msg)
         } catch (e: Exception) {
-            readings["status"] = e.javaClass.simpleName
+            dataLogger?.event("init_error", option.label, e.javaClass.simpleName)
+            stopTracker(e.javaClass.simpleName)
         }
     }
 
     private fun stopTracker(finalStatus: String?) {
         mainHandler.removeCallbacks(onDemandTimeout)
+        mainHandler.removeCallbacks(ticker)
+        mainHandler.removeCallbacks(autoAdvanceRunnable)
         tracker?.let { runCatching { it.unsetEventListener() } }
         tracker = null
-        if (finalStatus != null) readings["status"] = finalStatus
-        else active = null
+        active?.let { dataLogger?.event("sensor_end", it.label, finalStatus ?: "cancelled") }
+        if (finalStatus != null) {
+            readings[" status"] = finalStatus
+            if (autoRunIndex >= 0) {
+                autoRunIndex++
+                if (autoRunIndex < autoRunQueue.size) {
+                    mainHandler.postDelayed({ launchAutoStep() }, 1500L)
+                } else {
+                    finishAutoRun()
+                }
+            }
+        } else {
+            // Manual stop / back — save partial session file in background, return to menu
+            autoRunIndex = -1
+            autoRunQueue = emptyList()
+            val logger = dataLogger
+            dataLogger = null
+            active = null
+            if (logger != null) {
+                Thread {
+                    val file = logger.finish()
+                    runOnUiThread {
+                        connectionStatus = "Session saved: ${file.name}"
+                    }
+                }.start()
+            }
+        }
+    }
+
+    // ---------- Auto-run ----------
+
+    private fun startAutoRun() {
+        val excluded = setOf(HealthTrackerType.BIA_ON_DEMAND, HealthTrackerType.MF_BIA_ON_DEMAND)
+        autoRunQueue = menu.filter { it.type !in excluded }
+        if (autoRunQueue.isEmpty()) return
+        autoRunIndex = 0
+        dataLogger = DataLogger(this, autoRun = true)
+        launchAutoStep()
+    }
+
+    private fun launchAutoStep() {
+        if (autoRunIndex < 0) return  // cancelled between steps
+        val opt = autoRunQueue.getOrNull(autoRunIndex) ?: run { finishAutoRun(); return }
+        startTracker(opt)
+        // Continuous sensors have no built-in end; cap them at 30 s in auto-run
+        if (!opt.onDemand) mainHandler.postDelayed(autoAdvanceRunnable, 30_000L)
+    }
+
+    private fun finishAutoRun() {
+        autoRunIndex = -1
+        autoRunQueue = emptyList()
+        val logger = dataLogger
+        dataLogger = null
+        readings[" status"] = "✅ Auto run complete — saving…"
+        if (logger != null) {
+            val file = logger.finish()   // fast: just writes session_end line
+            sendSessionToPhone(file)     // updates readings[" status"] and eventually clears active
+        } else {
+            mainHandler.postDelayed({ active = null }, 2000L)
+        }
+    }
+
+    private fun sendSessionToPhone(file: File) {
+        if (!file.exists()) { active = null; return }
+        Wearable.getNodeClient(this).connectedNodes
+            .addOnSuccessListener { nodes ->
+                val node = nodes.firstOrNull()
+                if (node == null) {
+                    readings[" status"] = "No phone connected — file on watch:\n${file.name}"
+                    mainHandler.postDelayed({ active = null }, 5000L)
+                    return@addOnSuccessListener
+                }
+                readings[" status"] = "Sending to ${node.displayName}…"
+                Wearable.getChannelClient(this)
+                    .openChannel(node.id, "/avatar/${file.name}")
+                    .addOnSuccessListener { ch ->
+                        Wearable.getChannelClient(this).getOutputStream(ch)
+                            .addOnSuccessListener { stream ->
+                                Thread {
+                                    try {
+                                        file.inputStream().use { input -> input.copyTo(stream) }
+                                        stream.close()
+                                        Wearable.getChannelClient(this).close(ch)
+                                        file.delete()
+                                        runOnUiThread {
+                                            readings[" status"] = "✅ Sent to ${node.displayName}"
+                                            mainHandler.postDelayed({ active = null }, 3000L)
+                                        }
+                                    } catch (e: Exception) {
+                                        runOnUiThread {
+                                            readings[" status"] =
+                                                "⚠ Send error — file kept on watch:\n${file.name}"
+                                            mainHandler.postDelayed({ active = null }, 5000L)
+                                        }
+                                    }
+                                }.start()
+                            }
+                            .addOnFailureListener {
+                                readings[" status"] = "⚠ Stream error — file kept:\n${file.name}"
+                                mainHandler.postDelayed({ active = null }, 5000L)
+                            }
+                    }
+                    .addOnFailureListener {
+                        readings[" status"] = "⚠ Channel error — file kept:\n${file.name}"
+                        mainHandler.postDelayed({ active = null }, 5000L)
+                    }
+            }
+            .addOnFailureListener {
+                readings[" status"] = "⚠ Node lookup failed — file kept:\n${file.name}"
+                mainHandler.postDelayed({ active = null }, 5000L)
+            }
     }
 
     private fun isOnDemandComplete(option: SensorOption, dp: DataPoint): Boolean = try {
@@ -195,7 +411,13 @@ class MainActivity : ComponentActivity() {
                 dp.getValue(ValueKey.SpO2Set.STATUS) == 2       // MEASUREMENT_COMPLETED
             HealthTrackerType.SKIN_TEMPERATURE_ON_DEMAND ->
                 dp.getValue(ValueKey.SkinTemperatureSet.STATUS) == 0
-            else -> false  // PPG on-demand: let the 30 s timer end it
+            HealthTrackerType.BIA_ON_DEMAND ->
+                runCatching { dp.getValue(ValueKey.BiaSet.PROGRESS) >= 100 }.getOrElse { false }
+            HealthTrackerType.MF_BIA_ON_DEMAND ->
+                runCatching { dp.getValue(ValueKey.MfBiaSet.PROGRESS) >= 100 }.getOrElse { false }
+            // PPG and ECG on-demand stream raw samples with no "complete" flag —
+            // the doneOnTimeout timer ends them after the capture window.
+            else -> false
         }
     } catch (_: Exception) { false }
 
@@ -248,10 +470,90 @@ class MainActivity : ComponentActivity() {
                     readings["Ambient"] =
                         "${dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE)} °C"
                 }
+                HealthTrackerType.EDA_CONTINUOUS -> {
+                    readings["Skin conductance"] =
+                        "${dp.getValue(ValueKey.EdaSet.SKIN_CONDUCTANCE)} µS"
+                    readings["Status"] = "${dp.getValue(ValueKey.EdaSet.STATUS)}"
+                }
+                HealthTrackerType.ECG_ON_DEMAND -> {
+                    // LEAD_OFF is informational only — on this firmware it returns -1
+                    // regardless of contact and never transitions to 0 or 5.
+                    // Timer starts on first data packet (ECG removed from contactRequiredTypes).
+                    val leadOff = runCatching { dp.getValue(ValueKey.EcgSet.LEAD_OFF) }.getOrElse { -99 }
+                    readings["LEAD_OFF"] = when (leadOff) {
+                        0    -> "0 (contact OK)"
+                        5    -> "5 (no contact)"
+                        -99  -> "read error"
+                        else -> "$leadOff"
+                    }
+                    runCatching { readings["ECG mV"] = "${dp.getValue(ValueKey.EcgSet.ECG_MV)}" }
+                    runCatching { readings["Seq"] = "${dp.getValue(ValueKey.EcgSet.SEQUENCE)}" }
+                }
+                HealthTrackerType.BIA_ON_DEMAND -> {
+                    val progressResult = runCatching { dp.getValue(ValueKey.BiaSet.PROGRESS) }
+                    progressResult.exceptionOrNull()?.let { ex ->
+                        readings["BIA err"] = "${ex.javaClass.simpleName} — set profile in Samsung Health (Profile → age/height/weight/sex)"
+                        return
+                    }
+                    val progress = (progressResult.getOrNull() as? Number)?.toInt() ?: 0
+                    readings["Progress"] = "$progress %"
+                    if (progress == 0) return  // fingers not on electrodes yet
+                    if (!contactMade) {
+                        contactMade = true
+                        measureStart = android.os.SystemClock.elapsedRealtime()
+                        mainHandler.postDelayed(
+                            onDemandTimeout, ((option.expectedSeconds ?: 15) + 5) * 1000L
+                        )
+                    }
+                    if (progress >= 100) {
+                        readings["Body fat"] = runCatching {
+                            "${dp.getValue(ValueKey.BiaSet.BODY_FAT_RATIO)} %"
+                        }.getOrElse { "— (set profile in Samsung Health)" }
+                        readings["Skeletal muscle"] = runCatching {
+                            "${dp.getValue(ValueKey.BiaSet.SKELETAL_MUSCLE_MASS)} kg"
+                        }.getOrElse { "—" }
+                        readings["Body water"] = runCatching {
+                            "${dp.getValue(ValueKey.BiaSet.TOTAL_BODY_WATER)} L"
+                        }.getOrElse { "—" }
+                        readings["BMR"] = runCatching {
+                            "${dp.getValue(ValueKey.BiaSet.BASAL_METABOLIC_RATE)} kcal"
+                        }.getOrElse { "—" }
+                    }
+                }
+                HealthTrackerType.MF_BIA_ON_DEMAND -> {
+                    val progressResult = runCatching { dp.getValue(ValueKey.MfBiaSet.PROGRESS) }
+                    progressResult.exceptionOrNull()?.let { ex ->
+                        readings["BIA err"] = "${ex.javaClass.simpleName} — set profile in Samsung Health"
+                        return
+                    }
+                    val progress = (progressResult.getOrNull() as? Number)?.toInt() ?: 0
+                    readings["Progress"] = "$progress %"
+                    if (progress == 0) return  // fingers not on electrodes yet
+                    if (!contactMade) {
+                        contactMade = true
+                        measureStart = android.os.SystemClock.elapsedRealtime()
+                        mainHandler.postDelayed(
+                            onDemandTimeout, ((option.expectedSeconds ?: 15) + 5) * 1000L
+                        )
+                    }
+                    readings["Z 5kHz"] = runCatching {
+                        "${dp.getValue(ValueKey.MfBiaSet.BODY_IMPEDANCE_MAGNITUDE_5K)} Ω"
+                    }.getOrElse { "—" }
+                    readings["Z 50kHz"] = runCatching {
+                        "${dp.getValue(ValueKey.MfBiaSet.BODY_IMPEDANCE_MAGNITUDE_50K)} Ω"
+                    }.getOrElse { "—" }
+                    readings["Z 250kHz"] = runCatching {
+                        "${dp.getValue(ValueKey.MfBiaSet.BODY_IMPEDANCE_MAGNITUDE_250K)} Ω"
+                    }.getOrElse { "—" }
+                    readings["Phase 50kHz"] = runCatching {
+                        "${dp.getValue(ValueKey.MfBiaSet.BODY_IMPEDANCE_PHASE_50K)}°"
+                    }.getOrElse { "—" }
+                }
                 else -> readings["raw"] = "data received"
             }
         } catch (e: Exception) {
             readings["parse"] = e.javaClass.simpleName
+            dataLogger?.event("parse_error", option.label, e.javaClass.simpleName)
         }
     }
 
@@ -277,6 +579,7 @@ class MainActivity : ComponentActivity() {
             Spacer(Modifier.height(4.dp))
 
             val current = active
+            val inAuto = autoRunIndex >= 0
             if (current == null) {
                 // -------- Menu --------
                 BasicText(
@@ -285,6 +588,8 @@ class MainActivity : ComponentActivity() {
                         textAlign = TextAlign.Center)
                 )
                 Spacer(Modifier.height(10.dp))
+                MenuButton("▶ Auto Run All", Color(0xFF1A3A28)) { startAutoRun() }
+                Spacer(Modifier.height(6.dp))
                 menu.forEach { option ->
                     MenuButton(option.label, Color(0xFF1E1E1E)) { startTracker(option) }
                 }
@@ -294,8 +599,12 @@ class MainActivity : ComponentActivity() {
                 }
             } else {
                 // -------- Live readings --------
+                val title = if (inAuto)
+                    "${current.label}  (${autoRunIndex + 1}/${autoRunQueue.size})"
+                else
+                    current.label
                 BasicText(
-                    current.label,
+                    title,
                     style = TextStyle(color = Color.White, fontSize = 12.sp,
                         fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
                 )
@@ -308,7 +617,8 @@ class MainActivity : ComponentActivity() {
                     Spacer(Modifier.height(6.dp))
                 }
                 Spacer(Modifier.height(10.dp))
-                MenuButton("Stop / Back", Color(0xFF3A1212)) { stopTracker(null) }
+                val stopLabel = if (inAuto) "Cancel Auto Run" else "Stop / Back"
+                MenuButton(stopLabel, Color(0xFF3A1212)) { stopTracker(null) }
             }
         }
     }

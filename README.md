@@ -14,21 +14,31 @@ The app connects to the Samsung Health Sensor SDK and presents a simple menu —
 | Heart Rate | Continuous | BPM, signal quality, IBI list |
 | Accelerometer | Continuous | X / Y / Z axes |
 | PPG Green | Continuous | Raw PPG value + status |
+| **EDA (skin conductance)** | Continuous | Skin conductance (µS) + status — **Watch 8 only** |
 | PPG IR + Red | On-demand (~30 s) | IR and Red PPG values + status |
 | SpO2 | On-demand (~30 s) | Blood oxygen %, heart rate |
+| ECG | On-demand (~30 s) | ECG (mV), lead-off contact, sequence |
+| Body Comp / BIA | On-demand (~15 s) | Body fat %, skeletal muscle, body water, BMR |
+| Multi-freq BIA | On-demand (~15 s) | Impedance at 5 / 50 / 250 kHz + phase — **Watch 8** |
 | Skin Temperature | Continuous | Skin °C, ambient °C |
-| Skin Temperature | On-demand (~30 s) | Skin °C, ambient °C |
+| Skin Temperature | On-demand (~5 s) | Skin °C, ambient °C |
 
-The menu is built dynamically from the watch's reported capability list, so only sensors your specific device supports are shown.
+The menu is built dynamically from the watch's reported capability list, so **only sensors your specific device supports are shown**. On a Galaxy Watch 5 the EDA and Multi-freq BIA buttons are hidden automatically (the hardware doesn't report them); on a Galaxy Watch 8 all rows above appear.
+
+While a sensor is reading, a live status line shows either `🟢 live · Ns` (continuous) or `⏳ measuring · Ns / ~30s` (on-demand) so you can tell it's working during the long SpO2 / ECG / BIA measurements. On-demand sensors that need finger contact (ECG, BIA) display an on-screen instruction.
 
 ---
 
 ## Hardware & SDK
 
-- **Device:** Samsung Galaxy Watch 5
-- **OS:** Wear OS 3 (One UI Watch 4)
+- **Devices:** Samsung Galaxy Watch 5 and Galaxy Watch 8 (same APK; menu adapts per device)
+- **OS:** Wear OS 3+ (One UI Watch 4 on Watch 5 · One UI 8 Watch on Watch 8)
 - **SDK:** Samsung Health Sensor API 1.4.1 (bundled in `libs/`)
 - **Min SDK:** 30 · **Target SDK:** 35 · **Compile SDK:** 36.1
+
+> **EDA note:** EDA is Galaxy Watch 8-only hardware. Because `targetSdk = 35` (Android 15),
+> the legacy `BODY_SENSORS` permission still covers it. If you later raise `targetSdk` past 35,
+> switch to the runtime health permissions (`+ READ_ADDITIONAL_HEALTH_DATA`) per Samsung's EDA codelab.
 
 ---
 
