@@ -25,6 +25,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -35,6 +36,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.galaxywatch5.presentation.logging.DataLogger
+import com.example.galaxywatch5.presentation.ui.LogsScreen
 import com.google.android.gms.wearable.Wearable
 import java.io.File
 import com.samsung.android.service.health.tracking.ConnectionListener
@@ -97,6 +100,16 @@ class MainActivity : ComponentActivity() {
     private val menu = mutableStateListOf<SensorOption>()
     private var active by mutableStateOf<SensorOption?>(null)
     private val readings = mutableStateMapOf<String, String>()
+    // Landing screen is the AVATAR stress gauge; tapping it opens the sensor menu.
+    private var showMenu by mutableStateOf(false)
+    private var showLogs by mutableStateOf(false)
+    private var serviceConnected by mutableStateOf(false)
+
+    // ---- Live values for the home gauge (streamed by dedicated continuous trackers) ----
+    private var liveHr by mutableStateOf<Int?>(null)
+    private var liveEda by mutableStateOf<Float?>(null)
+    private var homeHrTracker: HealthTracker? = null
+    private var homeEdaTracker: HealthTracker? = null
 
     // ---------- SDK state ----------
 
@@ -172,6 +185,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopHomeMonitoring()
         stopTracker(null)
         healthService?.disconnectService()
     }
@@ -190,16 +204,69 @@ class MainActivity : ComponentActivity() {
                     menu.clear()
                     menu.addAll(candidates.filter { it.type in supported })
                     connectionStatus = "Connected (${supported.size} types, ECG_ON_DEMAND=$ecgOk)"
+                    serviceConnected = true
                 }
             }
             override fun onConnectionEnded() {
-                runOnUiThread { connectionStatus = "Disconnected" }
+                runOnUiThread { connectionStatus = "Disconnected"; serviceConnected = false }
             }
             override fun onConnectionFailed(e: HealthTrackerException) {
-                runOnUiThread { connectionStatus = "Failed (err ${e.errorCode})" }
+                runOnUiThread { connectionStatus = "Failed (err ${e.errorCode})"; serviceConnected = false }
             }
         }, this)
         healthService?.connectService()
+    }
+
+    // ---------- Home gauge live monitoring ----------
+    // Dedicated HR + EDA continuous trackers that feed the gauge. Kept separate from the
+    // menu's single `tracker`/`active` system so the two never interfere. Runs only while
+    // the gauge is on screen (started/stopped by HomeGauge's DisposableEffect).
+
+    private fun startHomeMonitoring() {
+        val svc = healthService ?: return
+        if (homeHrTracker != null || homeEdaTracker != null) return  // already running
+        val supported = svc.trackingCapability?.supportHealthTrackerTypes ?: emptyList()
+
+        // Heart rate — continuous stream
+        runCatching {
+            val t = svc.getHealthTracker(HealthTrackerType.HEART_RATE_CONTINUOUS)
+            t.setEventListener(object : HealthTracker.TrackerEventListener {
+                override fun onDataReceived(dataPoints: List<DataPoint>) {
+                    val dp = dataPoints.lastOrNull() ?: return
+                    val hr = runCatching { dp.getValue(ValueKey.HeartRateSet.HEART_RATE) }.getOrNull()
+                    if (hr != null && hr > 0) runOnUiThread { liveHr = hr }
+                }
+                override fun onFlushCompleted() {}
+                override fun onError(e: HealthTracker.TrackerError) {}
+            })
+            homeHrTracker = t
+        }
+
+        // EDA (skin conductance) — continuous stream, Watch 8 only
+        if (HealthTrackerType.EDA_CONTINUOUS in supported) {
+            runCatching {
+                val t = svc.getHealthTracker(HealthTrackerType.EDA_CONTINUOUS)
+                t.setEventListener(object : HealthTracker.TrackerEventListener {
+                    override fun onDataReceived(dataPoints: List<DataPoint>) {
+                        val dp = dataPoints.lastOrNull() ?: return
+                        val sc = runCatching {
+                            (dp.getValue(ValueKey.EdaSet.SKIN_CONDUCTANCE) as Number).toFloat()
+                        }.getOrNull()
+                        if (sc != null) runOnUiThread { liveEda = sc }
+                    }
+                    override fun onFlushCompleted() {}
+                    override fun onError(e: HealthTracker.TrackerError) {}
+                })
+                homeEdaTracker = t
+            }
+        }
+    }
+
+    private fun stopHomeMonitoring() {
+        homeHrTracker?.let { runCatching { it.unsetEventListener() } }
+        homeEdaTracker?.let { runCatching { it.unsetEventListener() } }
+        homeHrTracker = null
+        homeEdaTracker = null
     }
 
     // ---------- Start / stop ----------
@@ -561,6 +628,16 @@ class MainActivity : ComponentActivity() {
 
     @androidx.compose.runtime.Composable
     private fun Screen() {
+        // Landing on the AVATAR gauge when no sensor is running and the menu isn't open.
+        if (active == null && !showMenu) {
+            HomeGauge()
+            return
+        }
+        // Logs browser (reached from the sensor menu).
+        if (active == null && showLogs) {
+            LogsScreen(onBack = { showLogs = false })
+            return
+        }
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -588,6 +665,10 @@ class MainActivity : ComponentActivity() {
                         textAlign = TextAlign.Center)
                 )
                 Spacer(Modifier.height(10.dp))
+                MenuButton("‹ Home (gauge)", Color(0xFF2A2440)) { showMenu = false }
+                Spacer(Modifier.height(6.dp))
+                MenuButton("🗎 Logs / Sessions", Color(0xFF23303A)) { showLogs = true }
+                Spacer(Modifier.height(6.dp))
                 MenuButton("▶ Auto Run All", Color(0xFF1A3A28)) { startAutoRun() }
                 Spacer(Modifier.height(6.dp))
                 menu.forEach { option ->
@@ -621,6 +702,50 @@ class MainActivity : ComponentActivity() {
                 MenuButton(stopLabel, Color(0xFF3A1212)) { stopTracker(null) }
             }
         }
+    }
+
+    /**
+     * AVATAR landing screen: the stress gauge, mapped from whatever the app already has in
+     * [readings]. Reads that state only — no changes to the tracker callbacks or SDK layer.
+     * Tap anywhere to open the sensor menu.
+     */
+    @androidx.compose.runtime.Composable
+    private fun HomeGauge() {
+        // Stream live HR + EDA only while this screen is shown; stop on leave.
+        androidx.compose.runtime.DisposableEffect(serviceConnected) {
+            if (serviceConnected) startHomeMonitoring()
+            onDispose { stopHomeMonitoring() }
+        }
+        // Live values once the sensors report; sample fallbacks until the first packet.
+        val hr = liveHr ?: 72
+        val eda = liveEda ?: 2.1f
+        val score = remember(hr, eda) { deriveStressPlaceholder(hr, eda) }
+        // Whole face is tappable to open the sensor menu (no on-screen label needed).
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .clickable { showMenu = true }
+        ) {
+            StressGaugeRing(
+                stressScore = score,
+                stressLabel = avatarStressLabel(score),
+                hr = hr,
+                eda = eda,
+                isMonitoring = serviceConnected && liveHr != null,
+                ringColor = avatarStressColor(score),
+            )
+        }
+    }
+
+    /**
+     * Placeholder stress score from live HR + EDA. NOT a validated stress model — it just lets
+     * the gauge visibly respond to real data until a real model is wired in. The mockup fakes
+     * this value too.
+     */
+    private fun deriveStressPlaceholder(hr: Int, eda: Float): Int {
+        val hrPart = (hr - 60).coerceIn(0, 60) * 0.6f   // 0..36
+        val edaPart = (eda * 6f).coerceIn(0f, 60f)      // 0..60
+        return ((hrPart + edaPart) / 2f).toInt().coerceIn(5, 95)
     }
 
     @androidx.compose.runtime.Composable

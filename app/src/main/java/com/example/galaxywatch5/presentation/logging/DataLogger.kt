@@ -1,4 +1,4 @@
-package com.example.galaxywatch5.presentation
+package com.example.galaxywatch5.presentation.logging
 
 import android.content.Context
 import java.io.BufferedWriter
@@ -13,6 +13,8 @@ import java.util.Locale
  * Each line is a complete JSON object — safe for partial files on crash.
  * Keys are sanitised (spaces/brackets → underscores) so the file opens cleanly
  * in pandas: pd.read_json("file.jsonl", lines=True)
+ *
+ * Files land in [AvatarStorage.dir]; read them back with [SessionStore].
  */
 class DataLogger(context: Context, autoRun: Boolean) {
 
@@ -22,8 +24,7 @@ class DataLogger(context: Context, autoRun: Boolean) {
     private val writer: BufferedWriter
 
     init {
-        val dir = context.getExternalFilesDir("AVATAR") ?: context.filesDir
-        dir.mkdirs()
+        val dir = AvatarStorage.dir(context)
         file = File(dir, "avatar_$sessionId.jsonl")
         writer = BufferedWriter(FileWriter(file, false))
         writeLine(mapOf(
