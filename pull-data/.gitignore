@@ -1,0 +1,3 @@
+# Pulled session logs and the saved watch IP are local-only.
+avatar_logs/
+.watch

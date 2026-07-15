@@ -32,3 +32,8 @@ ehthumbs.db
 keystore.properties
 secrets.properties
 .env
+
+# Session recordings
+*.jsonl
+sessions/
+data/
