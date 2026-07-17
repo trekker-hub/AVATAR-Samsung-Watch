@@ -44,6 +44,7 @@ dependencies {
     implementation(libs.compose.material3)
     implementation(libs.compose.ui.tooling)
     implementation(libs.core.splashscreen)
+    implementation(libs.health.services.client)
     implementation(libs.play.services.wearable)
     implementation(libs.ui)
     implementation(libs.ui.graphics)

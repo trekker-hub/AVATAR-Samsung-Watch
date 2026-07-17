@@ -36,5 +36,9 @@ object SessionStore {
 
     fun delete(file: File): Boolean = runCatching { file.delete() }.getOrDefault(false)
 
+    /** Delete every session file. Returns how many were removed. */
+    fun deleteAll(context: Context): Int =
+        listSessions(context).count { delete(it.file) }
+
     data class ReadResult(val lines: List<String>, val truncated: Boolean)
 }

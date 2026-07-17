@@ -51,6 +51,10 @@ fun LogsScreen(onBack: () -> Unit) {
             sessions = sessions,
             onOpen = { selected = it },
             onBack = onBack,
+            onClearAll = {
+                SessionStore.deleteAll(context)
+                refresh++
+            },
         )
     } else {
         SessionDetail(
@@ -70,7 +74,9 @@ private fun SessionList(
     sessions: List<SessionFile>,
     onOpen: (SessionFile) -> Unit,
     onBack: () -> Unit,
+    onClearAll: () -> Unit,
 ) {
+    var confirmClear by remember { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
@@ -116,6 +122,20 @@ private fun SessionList(
                         )
                     }
                 }
+            }
+        }
+
+        if (sessions.isNotEmpty()) {
+            Spacer(Modifier.height(10.dp))
+            if (!confirmClear) {
+                PillButton("Clear all (${sessions.size})", Color(0xFF3A1212)) { confirmClear = true }
+            } else {
+                PillButton("Tap again to delete all", Color(0xFF7A1212)) {
+                    onClearAll()
+                    confirmClear = false
+                }
+                Spacer(Modifier.height(4.dp))
+                PillButton("Cancel", Color(0xFF2A2440)) { confirmClear = false }
             }
         }
 
