@@ -278,17 +278,25 @@ class MainActivity : ComponentActivity() {
         val readings by TrackingRepository.readings.collectAsState()
         val autoRun by TrackingRepository.autoRun.collectAsState()
         val statusMessage by TrackingRepository.statusMessage.collectAsState()
+        val monitoringAll by TrackingRepository.monitoringAll.collectAsState()
 
         // Force the display on for the whole session: screen-off idle throttles the sensor
         // stream, so foreground + screen-on is now the primary keep-alive. Scoped to an active
-        // session and inherently foreground-only; cleared on stop and on leaving composition.
-        val keepScreenOn = active != null
+        // session (single-sensor OR multi-sensor) and inherently foreground-only; cleared on stop
+        // and on leaving composition.
+        val keepScreenOn = active != null || monitoringAll
         DisposableEffect(keepScreenOn) {
             if (keepScreenOn)
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             else
                 window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
+        }
+
+        // Multi-sensor "Monitor All" mode takes over the screen while it runs.
+        if (monitoringAll) {
+            MonitorAllScreen()
+            return
         }
 
         // Landing on the AVATAR gauge when no sensor is running and the menu isn't open.
@@ -334,6 +342,10 @@ class MainActivity : ComponentActivity() {
                 Spacer(Modifier.height(6.dp))
                 MenuButton("▶ Auto Run All", Color(0xFF1A3A28)) {
                     sendTrackingCommand(SensorTrackingService.ACTION_AUTO_RUN)
+                }
+                Spacer(Modifier.height(6.dp))
+                MenuButton("📡 Monitor All (5 signals)", Color(0xFF243A1A)) {
+                    sendTrackingCommand(SensorTrackingService.ACTION_MONITOR_ALL)
                 }
                 Spacer(Modifier.height(6.dp))
                 menu.forEach { option ->
@@ -413,6 +425,60 @@ class MainActivity : ComponentActivity() {
         val hrPart = (hr - 60).coerceIn(0, 60) * 0.6f   // 0..36
         val edaPart = (eda * 6f).coerceIn(0f, 60f)      // 0..60
         return ((hrPart + edaPart) / 2f).toInt().coerceIn(5, 95)
+    }
+
+    /**
+     * Live view for the multi-sensor "Monitor All" mode. Collects each sensor's flow locally so
+     * high-rate updates (accelerometer) only recompose this leaf, not the whole Screen().
+     */
+    @androidx.compose.runtime.Composable
+    private fun MonitorAllScreen() {
+        val accel by TrackingRepository.accel.collectAsState()
+        val hr by TrackingRepository.heartRate.collectAsState()
+        val eda by TrackingRepository.eda.collectAsState()
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 18.dp, vertical = 28.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            BasicText(
+                "AVATAR — Monitor All",
+                style = TextStyle(
+                    color = Color(0xFF0FE0B0), fontSize = 14.sp,
+                    fontWeight = FontWeight.Bold, textAlign = TextAlign.Center
+                )
+            )
+            Spacer(Modifier.height(10.dp))
+
+            SignalRow("Accelerometer", accel?.let { "x=${it.x}  y=${it.y}  z=${it.z}" })
+            SignalRow("Heart rate", hr?.let { "${it.hr} bpm  (st ${it.status})" })
+            SignalRow("IBI", hr?.let { if (it.ibi.isEmpty()) "— (none this packet)" else "${it.ibi.size}: ${it.ibi.joinToString()}" })
+            SignalRow("EDA", eda?.let { "${it.skinConductance} µS  (st ${it.status})" })
+
+            Spacer(Modifier.height(12.dp))
+            MenuButton("Stop", Color(0xFF3A1212)) {
+                sendTrackingCommand(SensorTrackingService.ACTION_STOP)
+            }
+        }
+    }
+
+    /** One label/value pair on the Monitor-All screen; shows "waiting…" until the first packet. */
+    @androidx.compose.runtime.Composable
+    private fun SignalRow(label: String, value: String?) {
+        BasicText(label, style = TextStyle(color = Color(0xFF888888),
+            fontSize = 10.sp, textAlign = TextAlign.Center))
+        BasicText(
+            value ?: "waiting…",
+            style = TextStyle(
+                color = if (value != null) Color(0xFF33F26B) else Color(0xFF666666),
+                fontSize = 12.sp, textAlign = TextAlign.Center
+            )
+        )
+        Spacer(Modifier.height(6.dp))
     }
 
     @androidx.compose.runtime.Composable

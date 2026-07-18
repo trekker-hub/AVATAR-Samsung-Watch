@@ -23,6 +23,11 @@ class DataLogger(context: Context, autoRun: Boolean) {
 
     private val writer: BufferedWriter
 
+    // In multi-sensor mode several per-tracker HandlerThreads write concurrently, so every write
+    // path is synchronized; `closed` makes writes after finish() no-op instead of hitting a closed
+    // writer.
+    @Volatile private var closed = false
+
     init {
         val dir = AvatarStorage.dir(context)
         file = File(dir, "avatar_$sessionId.jsonl")
@@ -36,6 +41,7 @@ class DataLogger(context: Context, autoRun: Boolean) {
     }
 
     /** Log a sensor data point — pass the raw readings map or any field map. */
+    @Synchronized
     fun log(sensor: String, fields: Map<String, Any?>) {
         val m = LinkedHashMap<String, Any?>()
         m["type"]    = "reading"
@@ -47,6 +53,7 @@ class DataLogger(context: Context, autoRun: Boolean) {
     }
 
     /** Log a lifecycle event (sensor_start, sensor_end, error, etc.). */
+    @Synchronized
     fun event(type: String, sensor: String, detail: String = "") {
         writeLine(mapOf(
             "type"    to type,
@@ -57,19 +64,24 @@ class DataLogger(context: Context, autoRun: Boolean) {
         ))
     }
 
-    /** Close the file and return it — call once at session end. */
+    /** Close the file and return it — call once at session end. Idempotent. */
+    @Synchronized
     fun finish(): File {
-        writeLine(mapOf(
-            "type"    to "session_end",
-            "ts"      to System.currentTimeMillis(),
-            "session" to sessionId
-        ))
-        writer.flush()
-        writer.close()
+        if (!closed) {
+            writeLine(mapOf(
+                "type"    to "session_end",
+                "ts"      to System.currentTimeMillis(),
+                "session" to sessionId
+            ))
+            writer.flush()
+            writer.close()
+            closed = true
+        }
         return file
     }
 
     private fun writeLine(map: Map<String, Any?>) {
+        if (closed) return
         writer.write(toJson(map))
         writer.newLine()
         writer.flush()   // flush each line: safe vs crash, fast enough for <500 Hz

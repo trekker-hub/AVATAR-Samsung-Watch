@@ -1,5 +1,6 @@
 package com.example.galaxywatch5.presentation.tracking
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
@@ -7,9 +8,11 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.os.PowerManager
@@ -53,13 +56,51 @@ class SensorTrackingService : Service() {
     companion object {
         const val ACTION_START_SENSOR = "com.example.galaxywatch5.action.START_SENSOR"
         const val ACTION_AUTO_RUN = "com.example.galaxywatch5.action.AUTO_RUN"
+        const val ACTION_MONITOR_ALL = "com.example.galaxywatch5.action.MONITOR_ALL"
         const val ACTION_STOP = "com.example.galaxywatch5.action.STOP"
         const val EXTRA_SENSOR_ID = "sensor_id"
 
         private const val CHANNEL_ID = "tracking"
         private const val NOTIF_ID = 1
         private const val TAG = "SensorTrackingSvc"
+
+        // ---- Multi-sensor diagnostics / tuning ----
+        // Delay between each tracker's start. EDA is fussiest to initialize, so it starts first
+        // (index 0, no delay) and the rest follow this stagger. Tune here.
+        private const val STAGGER_MS = 500L
+
+        // Which sensors "Monitor All" starts. Flip this + rebuild to isolate a combination bug:
+        // EDA is always first. (b) proves software-vs-hardware since accel shares nothing with EDA.
+        private val DIAG_COMBO = DiagCombo.FULL
+
+        // Optional low-latency accelerometer: force the batched buffer out on a short timer instead
+        // of waiting for the SDK to flush it (~10 s batches). OFF by default — batched delivery is
+        // fine for post-hoc artifact rejection and flushing costs battery.
+        private const val ACCEL_FLUSH_ENABLED = false
+        private const val ACCEL_FLUSH_MS = 1500L
     }
+
+    /** Ordered sensor sets for the multi-sensor diagnostic. EDA is always first. */
+    private enum class DiagCombo(val sensors: List<Pair<String, HealthTrackerType>>) {
+        EDA_ONLY(listOf("EDA" to HealthTrackerType.EDA_CONTINUOUS)),
+        EDA_ACCEL(listOf(
+            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
+            "Accelerometer" to HealthTrackerType.ACCELEROMETER_CONTINUOUS)),
+        EDA_HR(listOf(
+            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
+            "Heart Rate" to HealthTrackerType.HEART_RATE_CONTINUOUS)),
+        FULL(listOf(
+            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
+            "Heart Rate" to HealthTrackerType.HEART_RATE_CONTINUOUS,
+            "Accelerometer" to HealthTrackerType.ACCELEROMETER_CONTINUOUS)),
+    }
+
+    /** One live multi-sensor tracker plus the dedicated thread its callbacks are delivered on. */
+    private class ActiveTracker(
+        val label: String,
+        val thread: HandlerThread,
+        val tracker: HealthTracker,
+    )
 
     // ---------- Engine state (moved from MainActivity) ----------
 
@@ -84,6 +125,12 @@ class SensorTrackingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var exerciseClient: ExerciseClient? = null
     private var exerciseStartRequested = false
+
+    // ---------- Multi-sensor "Monitor All" mode (independent of the single-tracker engine) ----------
+    // Each tracker gets its OWN HandlerThread so its callbacks are delivered on a dedicated thread,
+    // per Samsung's sample pattern — no shared handler across trackers.
+    private val activeTrackers = mutableListOf<ActiveTracker>()
+    private var multiActive = false
 
     /** Push a snapshot of [readings] to the UI. Call after every mutation batch. */
     private fun publish() = TrackingRepository.publishReadings(LinkedHashMap(readings))
@@ -148,7 +195,13 @@ class SensorTrackingService : Service() {
                 startExerciseSession()
                 withConnection { startAutoRun() }
             }
-            ACTION_STOP -> stopTracker(null)   // graceful save, then stopSelf
+            ACTION_MONITOR_ALL -> {
+                acquireWakeLock()
+                startExerciseSession()
+                withConnection { startMultiMonitor() }
+            }
+            // Stop the multi-sensor mode if it's running, otherwise the single-tracker session.
+            ACTION_STOP -> if (multiActive) stopMultiMonitor() else stopTracker(null)
             // Null intent = sticky restart after process death; the session state is
             // gone, so shut down cleanly rather than track nothing under a notification.
             else -> stopSelf()
@@ -160,6 +213,7 @@ class SensorTrackingService : Service() {
         super.onDestroy()
         try {
             mainHandler.removeCallbacksAndMessages(null)
+            teardownMultiTrackers()
             tracker?.let { runCatching { it.unsetEventListener() } }
             tracker = null
             // Ensure an interrupted session file still gets its session_end line.
@@ -259,6 +313,277 @@ class SensorTrackingService : Service() {
             }
             runCatching { client.clearUpdateCallbackAsync(exerciseCallback) }
         }, mainExecutor)
+    }
+
+    // ---------- Multi-sensor "Monitor All" mode ----------
+    // Registers CONTINUOUS trackers at once — Accelerometer, Heart Rate (which also carries IBI),
+    // and EDA — each with its own listener. Every tracker is availability-gated and fully isolated:
+    // an unsupported type is skipped, and a failure/onError in one sensor is logged and contained,
+    // never torn into the others. Every sample streams to logcat, the repo's per-sensor StateFlows
+    // (UI), and a JSONL session file (persistent, time-alignable). Runs on the service's own SDK
+    // connection.
+
+    private fun startMultiMonitor() {
+        // Defensively drop any single-tracker session so the two engines never overlap.
+        mainHandler.removeCallbacks(onDemandTimeout)
+        mainHandler.removeCallbacks(ticker)
+        mainHandler.removeCallbacks(autoAdvanceRunnable)
+        tracker?.let { runCatching { it.unsetEventListener() } }
+        tracker = null
+        active = null
+
+        multiActive = true
+        TrackingRepository.setMonitoringAll(true)
+        updateNotification("Monitoring sensors")
+
+        // One JSONL file for the whole multi-sensor session so every sample is retained with its
+        // own timestamp (all three sensors interleaved → time-alignable). Written concurrently from
+        // the per-tracker threads; DataLogger is synchronized.
+        dataLogger?.let { runCatching { it.finish() } }
+        dataLogger = DataLogger(this, autoRun = false)
+
+        val supported = supportedTypes()
+        val combo = DIAG_COMBO
+        Log.i(TAG, "[multi] starting combo=$combo (stagger=${STAGGER_MS}ms) — " +
+                "supported types: ${supported.joinToString()}")
+
+        // Staggered, EDA-first start: register each tracker on its own HandlerThread, spaced by
+        // STAGGER_MS, so EDA gets the first claim on resources and nothing races on a shared thread.
+        combo.sensors.forEachIndexed { index, (label, type) ->
+            mainHandler.postDelayed({ registerThreaded(label, type, supported) }, index * STAGGER_MS)
+        }
+    }
+
+    /**
+     * Availability-gate + permission-check one continuous tracker, then register it on its OWN
+     * dedicated HandlerThread with its OWN distinct listener — Samsung's supported pattern for
+     * running multiple continuous trackers at once. The callbacks are delivered on avatar-<label>.
+     */
+    private fun registerThreaded(
+        label: String,
+        type: HealthTrackerType,
+        supported: List<HealthTrackerType>
+    ) {
+        if (!multiActive) return  // stopped during the stagger window
+        if (type !in supported) {
+            Log.w(TAG, "[multi] $label ($type) not supported on this device — skipping")
+            return
+        }
+        // Log any missing runtime permission (types differ), but still attempt so the SDK's own
+        // PERMISSION_ERROR surfaces via onError too.
+        requiredPermissions(type)
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+            .forEach { Log.w(TAG, "[multi] $label missing permission: $it") }
+
+        val svc = healthService ?: return
+        val thread = HandlerThread("avatar-$label").apply { start() }
+        val handler = Handler(thread.looper)
+        try {
+            val t = svc.getHealthTracker(type)
+            val listener = makeListener(label, type)  // distinct instance per tracker
+            handler.post {
+                Log.i(TAG, "[multi] $label setEventListener on thread=${Thread.currentThread().name}")
+                t.setEventListener(listener)
+            }
+            activeTrackers.add(ActiveTracker(label, thread, t))
+            Log.i(TAG, "[multi] $label registered (own HandlerThread)")
+
+            // Optional: force the accelerometer's batched buffer out on a short timer. Runs on the
+            // tracker's own handler and stops when the thread is quit on teardown.
+            if (ACCEL_FLUSH_ENABLED && type == HealthTrackerType.ACCELEROMETER_CONTINUOUS) {
+                val flush = object : Runnable {
+                    override fun run() {
+                        runCatching { t.flush() }
+                        handler.postDelayed(this, ACCEL_FLUSH_MS)
+                    }
+                }
+                handler.postDelayed(flush, ACCEL_FLUSH_MS)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "[multi] $label failed to register: ${e.javaClass.simpleName}", e)
+            thread.quitSafely()
+        }
+    }
+
+    /** A fresh, distinct listener per tracker (never shared) — dispatches parsing by type. */
+    private fun makeListener(label: String, type: HealthTrackerType) =
+        object : HealthTracker.TrackerEventListener {
+            private var first = true
+            override fun onDataReceived(dataPoints: List<DataPoint>) {
+                val recvTs = System.currentTimeMillis()
+                if (dataPoints.isEmpty()) return
+                if (first) {
+                    first = false
+                    Log.i(TAG, "[multi] $label FIRST onDataReceived thread=${Thread.currentThread().name} " +
+                            "sdkTs=${dataPoints.last().timestamp} recvTs=$recvTs")
+                }
+                try {
+                    when (type) {
+                        HealthTrackerType.ACCELEROMETER_CONTINUOUS -> parseAccel(dataPoints, recvTs)
+                        HealthTrackerType.HEART_RATE_CONTINUOUS -> parseHr(dataPoints, recvTs)
+                        HealthTrackerType.EDA_CONTINUOUS -> parseEda(dataPoints, recvTs)
+                        else -> {}
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "[multi] $label parse error: ${e.javaClass.simpleName}", e)
+                }
+            }
+            override fun onFlushCompleted() {}
+            override fun onError(e: HealthTracker.TrackerError) {
+                // Full capture: this is where a swallowed EDA failure becomes visible. Isolated —
+                // one tracker's error never tears down the others.
+                Log.e(TAG, "[ERROR] $label onError = $e")
+            }
+        }
+
+    // ---- Per-sensor parsing (status-first: read status, guard each value, always log) ----
+
+    // Accelerometer has no STATUS field in this SDK — only X/Y/Z. The SDK batches many samples per
+    // callback (~300 every ~12 s = 25 Hz when the screen dims), so iterate the WHOLE list and store
+    // every sample with its own timestamp — reading only the last would drop ~299 of ~300 per batch.
+    private fun parseAccel(dps: List<DataPoint>, recvTs: Long) {
+        val n = dps.size
+        val midIdx = n / 2
+        var stored = 0
+        var allZero = true
+        var allIdentical = true
+        // First stored sample, used as the reference for the all-identical check.
+        var refX: Int? = null; var refY: Int? = null; var refZ: Int? = null
+        var lastX: Int? = null; var lastY: Int? = null; var lastZ: Int? = null
+        val probes = StringBuilder()  // X/Y/Z at first / middle / last positions, to see values vary
+
+        for ((i, dp) in dps.withIndex()) {
+            val x = runCatching { dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_X) }.getOrNull()
+            val y = runCatching { dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Y) }.getOrNull()
+            val z = runCatching { dp.getValue(ValueKey.AccelerometerSet.ACCELEROMETER_Z) }.getOrNull()
+            if (x != null && y != null && z != null) {
+                dataLogger?.log("Accelerometer", mapOf(
+                    "x" to x, "y" to y, "z" to z, "sdkTs" to dp.timestamp, "recvTs" to recvTs))
+                stored++
+                if (x != 0 || y != 0 || z != 0) allZero = false
+                if (refX == null) { refX = x; refY = y; refZ = z }
+                else if (x != refX || y != refY || z != refZ) allIdentical = false
+                lastX = x; lastY = y; lastZ = z
+            }
+            if (i == 0 || i == midIdx || i == n - 1) {
+                probes.append(" [$i]=($x,$y,$z)@${dp.timestamp}")
+            }
+        }
+
+        // One summary line per callback (not ~300) — every sample is still persisted above.
+        val firstTs = dps.first().timestamp
+        val lastTs = dps.last().timestamp
+        val spanMs = lastTs - firstTs
+        val avgMs = if (n > 1) spanMs.toDouble() / (n - 1) else 0.0
+        Log.d(TAG, "[multi] Accelerometer n=$n stored=$stored " +
+                "spanS=${"%.1f".format(spanMs / 1000.0)} avgMs=${"%.1f".format(avgMs)} " +
+                "first=$firstTs last=$lastTs probes:$probes recvTs=$recvTs")
+
+        // Distinguish a real read fault from healthy batching.
+        if (stored > 1 && allZero)
+            Log.w(TAG, "[multi] Accelerometer WARNING batch all-zero (n=$n) — possible read problem, not batching")
+        if (stored > 1 && allIdentical)
+            Log.w(TAG, "[multi] Accelerometer WARNING batch all-identical ($refX,$refY,$refZ) — possible stuck read")
+
+        if (lastX != null && lastY != null && lastZ != null)
+            TrackingRepository.setAccel(AccelSample(lastX, lastY, lastZ, n, lastTs, recvTs))
+    }
+
+    // Heart rate + IBI come from the SAME DataPoint — no separate IBI tracker exists.
+    private fun parseHr(dps: List<DataPoint>, recvTs: Long) {
+        val dp = dps.last()
+        val status = runCatching { dp.getValue(ValueKey.HeartRateSet.HEART_RATE_STATUS) }.getOrNull()
+        val hr = runCatching { dp.getValue(ValueKey.HeartRateSet.HEART_RATE) }.getOrNull()
+        val ibi = runCatching { dp.getValue(ValueKey.HeartRateSet.IBI_LIST) }.getOrNull() ?: emptyList()
+        val ibiStatus = runCatching { dp.getValue(ValueKey.HeartRateSet.IBI_STATUS_LIST) }.getOrNull() ?: emptyList()
+        val reading = if (hr != null) "hr=$hr ibiLen=${ibi.size} ibi=$ibi" else "no valid reading"
+        Log.d(TAG, "[multi] Heart Rate n=${dps.size} ${decodeStatus("HeartRate", status)} $reading " +
+                "sdkTs=${dp.timestamp} recvTs=$recvTs")
+        dataLogger?.log("HeartRate", mapOf(
+            "hr" to hr, "status" to status, "ibi" to ibi.toString(),
+            "ibiStatus" to ibiStatus.toString(), "sdkTs" to dp.timestamp, "recvTs" to recvTs))
+        if (hr != null && status != null)
+            TrackingRepository.setHeartRate(HrSample(hr, status, ibi, ibiStatus, dp.timestamp, recvTs))
+    }
+
+    private fun parseEda(dps: List<DataPoint>, recvTs: Long) {
+        val dp = dps.last()
+        val status = runCatching { dp.getValue(ValueKey.EdaSet.STATUS) }.getOrNull()
+        val sc = runCatching { dp.getValue(ValueKey.EdaSet.SKIN_CONDUCTANCE) }.getOrNull()
+        val reading = if (sc != null) "skinConductance=$sc µS" else "no valid reading"
+        Log.d(TAG, "[multi] EDA n=${dps.size} ${decodeStatus("EDA", status)} $reading " +
+                "sdkTs=${dp.timestamp} recvTs=$recvTs")
+        dataLogger?.log("EDA", mapOf(
+            "skinConductance" to sc, "status" to status, "sdkTs" to dp.timestamp, "recvTs" to recvTs))
+        if (sc != null && status != null)
+            TrackingRepository.setEda(EdaSample(sc, status, dp.timestamp, recvTs))
+    }
+
+    /** Runtime permissions the SDK needs per tracker type (differ by type). */
+    private fun requiredPermissions(type: HealthTrackerType): List<String> = when (type) {
+        HealthTrackerType.HEART_RATE_CONTINUOUS,
+        HealthTrackerType.EDA_CONTINUOUS -> listOf(Manifest.permission.BODY_SENSORS)
+        HealthTrackerType.ACCELEROMETER_CONTINUOUS -> listOf(Manifest.permission.ACTIVITY_RECOGNITION)
+        else -> emptyList()
+    }
+
+    /**
+     * Render a status int for logging: always keeps the raw number, and adds a plain-English
+     * label ONLY for codes Samsung officially documents. EDA codes are never invented — they log
+     * raw plus a pointer to the API reference to be filled in later.
+     */
+    private fun decodeStatus(sensor: String, status: Int?): String {
+        if (status == null) return "st=<unreadable>"
+        val label = when (sensor) {
+            "HeartRate" -> when (status) {
+                -3 -> "NOT WORN"            // Samsung-documented
+                1  -> "OK / valid reading"  // empirically observed here; only -3 is Samsung-documented
+                else -> null
+            }
+            // ECG uses LEAD_OFF, not STATUS: 0 = electrodes in contact, 5 = not in contact (both
+            // documented). Kept ready for a future ECG handler — nothing calls this branch yet.
+            "ECG" -> when (status) {
+                0 -> "electrodes in contact"
+                5 -> "not in contact"
+                else -> null
+            }
+            else -> null  // EDA: never invent meanings
+        }
+        if (label != null) return "st=$status ($label)"
+        val note = when (sensor) {
+            "EDA" -> " (negative = no valid reading; exact codes per Samsung ValueKey.EdaSet reference)"
+            else  -> ""
+        }
+        return "st=$status$note"
+    }
+
+    private fun stopMultiMonitor() {
+        teardownMultiTrackers()
+        stopSelf()
+    }
+
+    /**
+     * Unset every multi-sensor listener and quit each dedicated HandlerThread. Idempotent — safe
+     * from stop and onDestroy. Sets multiActive=false FIRST so any pending staggered start no-ops.
+     */
+    private fun teardownMultiTrackers() {
+        multiActive = false
+        // Null the logger first so any in-flight parse on a tracker thread stops writing, then
+        // finish it after the threads are quit (DataLogger is synchronized + closed-guarded, so a
+        // late write can't corrupt or throw).
+        val logger = dataLogger
+        if (activeTrackers.isNotEmpty()) {
+            dataLogger = null
+            activeTrackers.forEach { at ->
+                runCatching { at.tracker.unsetEventListener() }
+                at.thread.quitSafely()
+            }
+            activeTrackers.clear()
+            runCatching { logger?.finish() }
+            Log.i(TAG, "[multi] all trackers stopped + threads quit + log saved")
+        }
+        TrackingRepository.setMonitoringAll(false)
+        TrackingRepository.clearMultiSamples()
     }
 
     // ---------- Foreground notification ----------
