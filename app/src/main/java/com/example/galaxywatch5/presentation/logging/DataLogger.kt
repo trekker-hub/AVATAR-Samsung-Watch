@@ -16,7 +16,16 @@ import java.util.Locale
  *
  * Files land in [AvatarStorage.dir]; read them back with [SessionStore].
  */
-class DataLogger(context: Context, autoRun: Boolean) {
+/**
+ * @param lineSink optional additional sink for each written JSON line, called with the
+ * IDENTICAL string that is written to the file (used to mirror lines to the network
+ * stream). The file write is authoritative and never affected by the sink.
+ */
+class DataLogger(
+    context: Context,
+    autoRun: Boolean,
+    private val lineSink: ((String) -> Unit)? = null,
+) {
 
     val sessionId: String = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
     val file: File
@@ -82,9 +91,13 @@ class DataLogger(context: Context, autoRun: Boolean) {
 
     private fun writeLine(map: Map<String, Any?>) {
         if (closed) return
-        writer.write(toJson(map))
+        val json = toJson(map)
+        writer.write(json)
         writer.newLine()
         writer.flush()   // flush each line: safe vs crash, fast enough for <500 Hz
+        // Mirror the exact same line to the stream (if wired). Additive: never gates or
+        // affects the file write above.
+        lineSink?.invoke(json)
     }
 
     private fun toJson(map: Map<String, Any?>): String = buildString {

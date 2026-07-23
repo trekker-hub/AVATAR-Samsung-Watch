@@ -33,7 +33,14 @@ keystore.properties
 secrets.properties
 .env
 
-# Session recordings
+# Session recordings / raw data
 *.jsonl
 sessions/
 data/
+stream_logs/
+pull-data/Simulate/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo

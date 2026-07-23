@@ -37,26 +37,27 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.wear.tooling.preview.devices.WearDevices
+import com.example.galaxywatch5.presentation.theme.AvatarTokens
 import kotlinx.coroutines.delay
 import java.time.LocalTime
 import java.time.format.DateTimeFormatter
 
 /**
- * AVATAR calm-first palette, lifted from the web mockup (Front End/watch-screens.jsx,
- * "ring" direction). Kept private to this file so the composable is self-contained;
- * expose only [avatarStressColor] / [avatarStressLabel] for callers that map bands.
+ * AVATAR calm-first palette, now sourced from the shared [AvatarTokens] design system so every
+ * screen matches. These are thin references to the tokens — the values are identical, so the
+ * gauge renders exactly as before; expose only [avatarStressColor] / [avatarStressLabel] for
+ * callers that map bands.
  */
 private object AvatarColors {
-    val Face = Color(0xFFFAF9F5)   // warm cream background
-    val Ink = Color(0xFF141628)    // high-contrast text
-    val Accent = Color(0xFF5A4FC4) // lilac
-    val Tint = Color(0xFFE9E7FB)   // pale lavender (pill)
-    val Green = Color(0xFF0F8A66)  // calm
-    val Orange = Color(0xFFCC5220) // high stress
-
-    val Track = Ink.copy(alpha = 0.08f)  // light neutral gray ring track
-    val Muted = Ink.copy(alpha = 0.55f)
-    val Faint = Ink.copy(alpha = 0.40f)
+    val Face = AvatarTokens.Face
+    val Ink = AvatarTokens.Ink
+    val Accent = AvatarTokens.Accent
+    val Tint = AvatarTokens.Tint
+    val Green = AvatarTokens.Green
+    val Orange = AvatarTokens.Orange
+    val Track = AvatarTokens.Track
+    val Muted = AvatarTokens.Muted
+    val Faint = AvatarTokens.Faint
 }
 
 /** Ring geometry: a 270° gauge with a 90° "mouth" at the bottom (matches the mockup). */

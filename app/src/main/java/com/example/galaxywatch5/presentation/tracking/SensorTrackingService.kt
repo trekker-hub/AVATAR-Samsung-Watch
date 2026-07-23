@@ -30,6 +30,7 @@ import androidx.health.services.client.data.ExerciseUpdate
 import com.example.galaxywatch5.R
 import com.example.galaxywatch5.presentation.MainActivity
 import com.example.galaxywatch5.presentation.logging.DataLogger
+import com.example.galaxywatch5.presentation.streaming.StreamClient
 import com.google.android.gms.wearable.Wearable
 import com.samsung.android.service.health.tracking.ConnectionListener
 import com.samsung.android.service.health.tracking.HealthTracker
@@ -57,8 +58,13 @@ class SensorTrackingService : Service() {
         const val ACTION_START_SENSOR = "com.example.galaxywatch5.action.START_SENSOR"
         const val ACTION_AUTO_RUN = "com.example.galaxywatch5.action.AUTO_RUN"
         const val ACTION_MONITOR_ALL = "com.example.galaxywatch5.action.MONITOR_ALL"
+        const val ACTION_STREAM_ON = "com.example.galaxywatch5.action.STREAM_ON"
+        const val ACTION_STREAM_OFF = "com.example.galaxywatch5.action.STREAM_OFF"
+        const val ACTION_SET_TRACKER = "com.example.galaxywatch5.action.SET_TRACKER"
         const val ACTION_STOP = "com.example.galaxywatch5.action.STOP"
         const val EXTRA_SENSOR_ID = "sensor_id"
+        const val EXTRA_TRACKER_LABEL = "tracker_label"
+        const val EXTRA_TRACKER_ON = "tracker_on"
 
         private const val CHANNEL_ID = "tracking"
         private const val NOTIF_ID = 1
@@ -69,30 +75,24 @@ class SensorTrackingService : Service() {
         // (index 0, no delay) and the rest follow this stagger. Tune here.
         private const val STAGGER_MS = 500L
 
-        // Which sensors "Monitor All" starts. Flip this + rebuild to isolate a combination bug:
-        // EDA is always first. (b) proves software-vs-hardware since accel shares nothing with EDA.
-        private val DIAG_COMBO = DiagCombo.FULL
+        // Canonical multi-monitor tracker order. EDA is always FIRST — part of the hard-won
+        // EDA/HR fix (per-tracker HandlerThread + EDA-first staggered start); do not reorder.
+        // WHICH of these actually start is decided at runtime by the per-tracker toggles in
+        // TrackingRepository.trackerEnabled (superseding the old compile-time DiagCombo
+        // diagnostic): known-good trio defaults ON, PPG and Skin Temp default OFF.
+        private val MULTI_TRACKERS = listOf(
+            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
+            "Heart Rate" to HealthTrackerType.HEART_RATE_CONTINUOUS,
+            "Accelerometer" to HealthTrackerType.ACCELEROMETER_CONTINUOUS,
+            "PPG" to HealthTrackerType.PPG_CONTINUOUS,
+            "Skin Temp" to HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS,
+        )
 
         // Optional low-latency accelerometer: force the batched buffer out on a short timer instead
         // of waiting for the SDK to flush it (~10 s batches). OFF by default — batched delivery is
         // fine for post-hoc artifact rejection and flushing costs battery.
         private const val ACCEL_FLUSH_ENABLED = false
         private const val ACCEL_FLUSH_MS = 1500L
-    }
-
-    /** Ordered sensor sets for the multi-sensor diagnostic. EDA is always first. */
-    private enum class DiagCombo(val sensors: List<Pair<String, HealthTrackerType>>) {
-        EDA_ONLY(listOf("EDA" to HealthTrackerType.EDA_CONTINUOUS)),
-        EDA_ACCEL(listOf(
-            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
-            "Accelerometer" to HealthTrackerType.ACCELEROMETER_CONTINUOUS)),
-        EDA_HR(listOf(
-            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
-            "Heart Rate" to HealthTrackerType.HEART_RATE_CONTINUOUS)),
-        FULL(listOf(
-            "EDA" to HealthTrackerType.EDA_CONTINUOUS,
-            "Heart Rate" to HealthTrackerType.HEART_RATE_CONTINUOUS,
-            "Accelerometer" to HealthTrackerType.ACCELEROMETER_CONTINUOUS)),
     }
 
     /** One live multi-sensor tracker plus the dedicated thread its callbacks are delivered on. */
@@ -120,6 +120,10 @@ class SensorTrackingService : Service() {
     private var autoRunIndex = -1    // -1 = not in auto-run
     private var dataLogger: DataLogger? = null
 
+    // ---------- Network streaming (additive; independent of sensors + local .jsonl) ----------
+    // Owns the socket + reconnect loop. DataLoggers mirror each written line here via enqueue.
+    private val streamClient = StreamClient()
+
     // ---------- Screen-off keep-alive (Samsung suspends plain FGS during idle) ----------
 
     private var wakeLock: PowerManager.WakeLock? = null
@@ -131,6 +135,7 @@ class SensorTrackingService : Service() {
     // per Samsung's sample pattern — no shared handler across trackers.
     private val activeTrackers = mutableListOf<ActiveTracker>()
     private var multiActive = false
+    private var lastSkinTempCbTs = 0L   // previous SkinTemperature callback, for cadence logging
 
     /** Push a snapshot of [readings] to the UI. Call after every mutation batch. */
     private fun publish() = TrackingRepository.publishReadings(LinkedHashMap(readings))
@@ -173,6 +178,13 @@ class SensorTrackingService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    override fun onCreate() {
+        super.onCreate()
+        // A service instance is created fresh per session, so this coincides with "start
+        // monitoring". Honour the user's streaming toggle; enqueue is a no-op until started.
+        if (TrackingRepository.streamEnabled.value) streamClient.start()
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         // Must run before anything else — startForegroundService requires it within 5 s,
         // for every action including STOP.
@@ -200,6 +212,20 @@ class SensorTrackingService : Service() {
                 startExerciseSession()
                 withConnection { startMultiMonitor() }
             }
+            // Streaming on/off. Purely toggles the network sender — never touches trackers,
+            // the wake lock, the local file, or the service lifecycle.
+            ACTION_STREAM_ON -> {
+                TrackingRepository.setStreamEnabled(true)
+                streamClient.start()
+            }
+            ACTION_STREAM_OFF -> {
+                TrackingRepository.setStreamEnabled(false)
+                streamClient.stop()
+            }
+            // Per-tracker toggle: starts/stops ONLY the named tracker; never touches the others.
+            ACTION_SET_TRACKER -> setTrackerEnabled(
+                intent.getStringExtra(EXTRA_TRACKER_LABEL),
+                intent.getBooleanExtra(EXTRA_TRACKER_ON, false))
             // Stop the multi-sensor mode if it's running, otherwise the single-tracker session.
             ACTION_STOP -> if (multiActive) stopMultiMonitor() else stopTracker(null)
             // Null intent = sticky restart after process death; the session state is
@@ -227,6 +253,7 @@ class SensorTrackingService : Service() {
             // Every stop path funnels through stopSelf() → here, so the exercise session
             // and wake lock can never outlive tracking. Lock released last so the CPU
             // stays up through teardown.
+            streamClient.stop()   // stop the sender + reconnect loop; no thread/socket leak
             endExerciseSession()
             releaseWakeLock()
         }
@@ -340,17 +367,68 @@ class SensorTrackingService : Service() {
         // own timestamp (all three sensors interleaved → time-alignable). Written concurrently from
         // the per-tracker threads; DataLogger is synchronized.
         dataLogger?.let { runCatching { it.finish() } }
-        dataLogger = DataLogger(this, autoRun = false)
+        dataLogger = DataLogger(this, autoRun = false, lineSink = streamClient::enqueue)
 
         val supported = supportedTypes()
-        val combo = DIAG_COMBO
-        Log.i(TAG, "[multi] starting combo=$combo (stagger=${STAGGER_MS}ms) — " +
-                "supported types: ${supported.joinToString()}")
+        val enabled = TrackingRepository.trackerEnabled.value
+        val sensors = MULTI_TRACKERS.filter { enabled[it.first] == true }
+        Log.i(TAG, "[multi] starting ${sensors.map { it.first }} (stagger=${STAGGER_MS}ms, " +
+                "toggles=$enabled) — supported types: ${supported.joinToString()}")
 
         // Staggered, EDA-first start: register each tracker on its own HandlerThread, spaced by
         // STAGGER_MS, so EDA gets the first claim on resources and nothing races on a shared thread.
-        combo.sensors.forEachIndexed { index, (label, type) ->
+        sensors.forEachIndexed { index, (label, type) ->
             mainHandler.postDelayed({ registerThreaded(label, type, supported) }, index * STAGGER_MS)
+        }
+    }
+
+    /**
+     * Per-tracker toggle: record the preference and, while Monitor All is live, start or stop
+     * ONLY that tracker (its own listener + its own HandlerThread). Other trackers are never
+     * touched, so a misbehaving new sensor can be dropped without losing the known-good set.
+     */
+    private fun setTrackerEnabled(label: String?, on: Boolean) {
+        val entry = MULTI_TRACKERS.firstOrNull { it.first == label }
+        if (entry == null) {
+            Log.w(TAG, "[toggle] unknown tracker label: $label")
+            return
+        }
+        TrackingRepository.setTrackerEnabled(entry.first, on)
+        if (!multiActive) {
+            // Preference stored for the next Monitor All start. If this toggle intent is the only
+            // reason the service is up (no single-tracker session either), shut back down.
+            if (active == null) stopSelf()
+            return
+        }
+        if (on) {
+            val already = activeTrackers.any {
+                it.label == entry.first || (entry.first == "PPG" && it.label.startsWith("PPG"))
+            }
+            if (already) {
+                Log.i(TAG, "[toggle] ${entry.first} ON — already active, nothing to do")
+            } else {
+                Log.i(TAG, "[toggle] ${entry.first} ON — registering live")
+                registerThreaded(entry.first, entry.second, supportedTypes())
+            }
+        } else {
+            stopSingleTracker(entry.first)
+        }
+    }
+
+    /** Stop ONE tracker by label ("PPG" also matches its legacy per-channel fallback labels). */
+    private fun stopSingleTracker(label: String) {
+        val targets = activeTrackers.filter {
+            it.label == label || (label == "PPG" && it.label.startsWith("PPG"))
+        }
+        if (targets.isEmpty()) {
+            Log.i(TAG, "[toggle] $label OFF — was not active")
+            return
+        }
+        targets.forEach { at ->
+            runCatching { at.tracker.unsetEventListener() }
+            at.thread.quitSafely()
+            activeTrackers.remove(at)
+            Log.i(TAG, "[toggle] ${at.label} OFF — listener unset, own thread quit")
         }
     }
 
@@ -366,6 +444,24 @@ class SensorTrackingService : Service() {
     ) {
         if (!multiActive) return  // stopped during the stagger window
         if (type !in supported) {
+            // Capability fallback: some firmwares expose per-channel PPG trackers instead of the
+            // combined PPG_CONTINUOUS. Register whichever per-channel types the capability list
+            // actually contains — each with its own thread + listener, like every other tracker.
+            if (type == HealthTrackerType.PPG_CONTINUOUS) {
+                val legacy = listOf(
+                    "PPG Green" to HealthTrackerType.PPG_GREEN,
+                    "PPG IR" to HealthTrackerType.PPG_IR,
+                    "PPG Red" to HealthTrackerType.PPG_RED,
+                ).filter { it.second in supported }
+                if (legacy.isEmpty()) {
+                    Log.w(TAG, "[multi] $label ($type) not supported on this device — skipping")
+                } else {
+                    Log.w(TAG, "[multi] PPG_CONTINUOUS unsupported — falling back to per-channel " +
+                            "trackers: ${legacy.map { it.first }}")
+                    legacy.forEach { (l, t) -> registerThreaded(l, t, supported) }
+                }
+                return
+            }
             Log.w(TAG, "[multi] $label ($type) not supported on this device — skipping")
             return
         }
@@ -379,7 +475,11 @@ class SensorTrackingService : Service() {
         val thread = HandlerThread("avatar-$label").apply { start() }
         val handler = Handler(thread.looper)
         try {
-            val t = svc.getHealthTracker(type)
+            // PPG_CONTINUOUS requires the PpgType-set overload; all three channels in one tracker.
+            val t = if (type == HealthTrackerType.PPG_CONTINUOUS)
+                svc.getHealthTracker(type, setOf(PpgType.GREEN, PpgType.IR, PpgType.RED))
+            else
+                svc.getHealthTracker(type)
             val listener = makeListener(label, type)  // distinct instance per tracker
             handler.post {
                 Log.i(TAG, "[multi] $label setEventListener on thread=${Thread.currentThread().name}")
@@ -422,6 +522,14 @@ class SensorTrackingService : Service() {
                         HealthTrackerType.ACCELEROMETER_CONTINUOUS -> parseAccel(dataPoints, recvTs)
                         HealthTrackerType.HEART_RATE_CONTINUOUS -> parseHr(dataPoints, recvTs)
                         HealthTrackerType.EDA_CONTINUOUS -> parseEda(dataPoints, recvTs)
+                        HealthTrackerType.PPG_CONTINUOUS -> parsePpg(dataPoints, recvTs)
+                        HealthTrackerType.PPG_GREEN -> parsePpgChannel("PPG_GREEN",
+                            ValueKey.PpgGreenSet.PPG_GREEN, ValueKey.PpgGreenSet.STATUS, dataPoints, recvTs)
+                        HealthTrackerType.PPG_IR -> parsePpgChannel("PPG_IR",
+                            ValueKey.PpgIrSet.PPG_IR, ValueKey.PpgIrSet.STATUS, dataPoints, recvTs)
+                        HealthTrackerType.PPG_RED -> parsePpgChannel("PPG_RED",
+                            ValueKey.PpgRedSet.PPG_RED, ValueKey.PpgRedSet.STATUS, dataPoints, recvTs)
+                        HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS -> parseSkinTemp(dataPoints, recvTs)
                         else -> {}
                     }
                 } catch (e: Exception) {
@@ -519,10 +627,108 @@ class SensorTrackingService : Service() {
             TrackingRepository.setEda(EdaSample(sc, status, dp.timestamp, recvTs))
     }
 
+    // PPG_CONTINUOUS delivers all three optical channels per DataPoint at 25 Hz and batches like
+    // the accelerometer — iterate the WHOLE list; each sample keeps its own sdkTs. Status-first
+    // read order per sample: statuses, then values, each guarded; the sample is always logged.
+    private fun parsePpg(dps: List<DataPoint>, recvTs: Long) {
+        val n = dps.size
+        val midIdx = n / 2
+        var stored = 0
+        var allZero = true
+        var allIdentical = true
+        var refG: Int? = null; var refIr: Int? = null; var refR: Int? = null
+        var last: PpgSample? = null
+        val probes = StringBuilder()  // green/ir/red at first / middle / last positions
+
+        for ((i, dp) in dps.withIndex()) {
+            val gSt = runCatching { dp.getValue(ValueKey.PpgSet.GREEN_STATUS) }.getOrNull()
+            val irSt = runCatching { dp.getValue(ValueKey.PpgSet.IR_STATUS) }.getOrNull()
+            val rSt = runCatching { dp.getValue(ValueKey.PpgSet.RED_STATUS) }.getOrNull()
+            val g = runCatching { dp.getValue(ValueKey.PpgSet.PPG_GREEN) }.getOrNull()
+            val ir = runCatching { dp.getValue(ValueKey.PpgSet.PPG_IR) }.getOrNull()
+            val r = runCatching { dp.getValue(ValueKey.PpgSet.PPG_RED) }.getOrNull()
+            dataLogger?.log("PPG", mapOf(
+                "green" to g, "red" to r, "ir" to ir,
+                "greenStatus" to gSt, "irStatus" to irSt, "redStatus" to rSt,
+                "sdkTs" to dp.timestamp, "recvTs" to recvTs))
+            stored++
+            if ((g ?: 0) != 0 || (ir ?: 0) != 0 || (r ?: 0) != 0) allZero = false
+            if (refG == null && refIr == null && refR == null) { refG = g; refIr = ir; refR = r }
+            else if (g != refG || ir != refIr || r != refR) allIdentical = false
+            last = PpgSample(g, ir, r, gSt, irSt, rSt, n, dp.timestamp, recvTs)
+            if (i == 0 || i == midIdx || i == n - 1) {
+                probes.append(" [$i]=g$g/ir$ir/r$r@${dp.timestamp}")
+            }
+        }
+
+        // One summary line per callback — every sample is still persisted above.
+        val firstTs = dps.first().timestamp
+        val lastTs = dps.last().timestamp
+        val spanMs = lastTs - firstTs
+        val avgMs = if (n > 1) spanMs.toDouble() / (n - 1) else 0.0
+        Log.d(TAG, "[multi] PPG n=$n stored=$stored " +
+                "spanS=${"%.1f".format(spanMs / 1000.0)} avgMs=${"%.1f".format(avgMs)} " +
+                "first=$firstTs last=$lastTs probes:$probes recvTs=$recvTs")
+        if (stored > 1 && allZero)
+            Log.w(TAG, "[multi] PPG WARNING batch all-zero (n=$n) — possible read problem, not batching")
+        if (stored > 1 && allIdentical)
+            Log.w(TAG, "[multi] PPG WARNING batch all-identical (g$refG/ir$refIr/r$refR) — possible stuck read")
+
+        last?.let { TrackingRepository.setPpg(it) }
+    }
+
+    // Continuous skin temperature: OBJECT_TEMPERATURE (= skin) + AMBIENT_TEMPERATURE per
+    // DataPoint. The delivery rate is undocumented, so n and callback cadence are logged at INFO
+    // to reveal what this device really does. Iterate every DataPoint — batching must not lose
+    // samples. Status-first, each value guarded, sample always logged.
+    private fun parseSkinTemp(dps: List<DataPoint>, recvTs: Long) {
+        val sinceMs = if (lastSkinTempCbTs == 0L) -1 else recvTs - lastSkinTempCbTs
+        lastSkinTempCbTs = recvTs
+        var last: SkinTempSample? = null
+        for (dp in dps) {
+            val status = runCatching { dp.getValue(ValueKey.SkinTemperatureSet.STATUS) }.getOrNull()
+            val skin = runCatching { dp.getValue(ValueKey.SkinTemperatureSet.OBJECT_TEMPERATURE) }.getOrNull()
+            val ambient = runCatching { dp.getValue(ValueKey.SkinTemperatureSet.AMBIENT_TEMPERATURE) }.getOrNull()
+            dataLogger?.log("SkinTemperature", mapOf(
+                "skinTemp" to skin, "ambientTemp" to ambient, "status" to status,
+                "sdkTs" to dp.timestamp, "recvTs" to recvTs))
+            last = SkinTempSample(skin, ambient, status, dps.size, dp.timestamp, recvTs)
+        }
+        Log.i(TAG, "[multi] SkinTemperature n=${dps.size} sinceLastCbMs=$sinceMs " +
+                "first=${dps.first().timestamp} last=${dps.last().timestamp} " +
+                "skin=${last?.skin}°C amb=${last?.ambient}°C st=${last?.status} recvTs=$recvTs")
+        last?.let { TrackingRepository.setSkinTemp(it) }
+    }
+
+    // Legacy per-channel PPG tracker (capability fallback only): one value + status per DataPoint.
+    private fun parsePpgChannel(
+        sensor: String,
+        valueKey: ValueKey<Int>,
+        statusKey: ValueKey<Int>,
+        dps: List<DataPoint>,
+        recvTs: Long,
+    ) {
+        var lastV: Int? = null
+        for (dp in dps) {
+            val status = runCatching { dp.getValue(statusKey) }.getOrNull()
+            val v = runCatching { dp.getValue(valueKey) }.getOrNull()
+            dataLogger?.log(sensor, mapOf(
+                "value" to v, "status" to status, "sdkTs" to dp.timestamp, "recvTs" to recvTs))
+            lastV = v
+        }
+        Log.d(TAG, "[multi] $sensor n=${dps.size} last=$lastV " +
+                "sdkTs=${dps.last().timestamp} recvTs=$recvTs")
+    }
+
     /** Runtime permissions the SDK needs per tracker type (differ by type). */
     private fun requiredPermissions(type: HealthTrackerType): List<String> = when (type) {
         HealthTrackerType.HEART_RATE_CONTINUOUS,
-        HealthTrackerType.EDA_CONTINUOUS -> listOf(Manifest.permission.BODY_SENSORS)
+        HealthTrackerType.EDA_CONTINUOUS,
+        HealthTrackerType.PPG_CONTINUOUS,
+        HealthTrackerType.PPG_GREEN,
+        HealthTrackerType.PPG_IR,
+        HealthTrackerType.PPG_RED,
+        HealthTrackerType.SKIN_TEMPERATURE_CONTINUOUS -> listOf(Manifest.permission.BODY_SENSORS)
         HealthTrackerType.ACCELEROMETER_CONTINUOUS -> listOf(Manifest.permission.ACTIVITY_RECOGNITION)
         else -> emptyList()
     }
@@ -663,7 +869,7 @@ class SensorTrackingService : Service() {
         val svc = healthService ?: return
         // For individual manual taps (not part of auto-run), start a fresh session log
         if (autoRunIndex < 0 && dataLogger == null) {
-            dataLogger = DataLogger(this, autoRun = false)
+            dataLogger = DataLogger(this, autoRun = false, lineSink = streamClient::enqueue)
         }
         readings.clear()
         option.hint?.let { readings[" info"] = it }
@@ -798,7 +1004,7 @@ class SensorTrackingService : Service() {
         if (autoRunQueue.isEmpty()) { stopSelf(); return }
         autoRunIndex = 0
         syncAutoRun()
-        dataLogger = DataLogger(this, autoRun = true)
+        dataLogger = DataLogger(this, autoRun = true, lineSink = streamClient::enqueue)
         launchAutoStep()
     }
 

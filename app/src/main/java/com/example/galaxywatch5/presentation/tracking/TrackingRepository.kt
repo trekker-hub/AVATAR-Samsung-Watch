@@ -17,6 +17,17 @@ data class HrSample(
     val sdkTs: Long, val recvTs: Long
 )
 data class EdaSample(val skinConductance: Float, val status: Int, val sdkTs: Long, val recvTs: Long)
+// Combined PPG_CONTINUOUS sample: three optical channels, each with its own status int.
+data class PpgSample(
+    val green: Int?, val ir: Int?, val red: Int?,
+    val greenStatus: Int?, val irStatus: Int?, val redStatus: Int?,
+    val n: Int, val sdkTs: Long, val recvTs: Long
+)
+// Skin (OBJECT_TEMPERATURE) + ambient temperature from one SkinTemperatureSet DataPoint.
+data class SkinTempSample(
+    val skin: Float?, val ambient: Float?, val status: Int?,
+    val n: Int, val sdkTs: Long, val recvTs: Long
+)
 
 /**
  * Single source of truth for tracking-session state. SensorTrackingService writes,
@@ -51,6 +62,33 @@ object TrackingRepository {
     private val _eda = MutableStateFlow<EdaSample?>(null)
     val eda: StateFlow<EdaSample?> = _eda.asStateFlow()
 
+    private val _ppg = MutableStateFlow<PpgSample?>(null)
+    val ppg: StateFlow<PpgSample?> = _ppg.asStateFlow()
+
+    private val _skinTemp = MutableStateFlow<SkinTempSample?>(null)
+    val skinTemp: StateFlow<SkinTempSample?> = _skinTemp.asStateFlow()
+
+    // ---- Per-tracker enable switches (safety valve) ----
+    // Keyed by the multi-monitor tracker labels. Known-good trio defaults ON; new sensors OFF, so
+    // a misbehaving new tracker can be excluded (or dropped live) without a redeploy. Like
+    // streamEnabled, deliberately NOT reset by clear() — persists for the life of the process.
+    val defaultTrackerEnabled = mapOf(
+        "EDA" to true, "Heart Rate" to true, "Accelerometer" to true,
+        "PPG" to false, "Skin Temp" to false,
+    )
+    private val _trackerEnabled = MutableStateFlow(defaultTrackerEnabled)
+    val trackerEnabled: StateFlow<Map<String, Boolean>> = _trackerEnabled.asStateFlow()
+    internal fun setTrackerEnabled(label: String, on: Boolean) {
+        _trackerEnabled.value = _trackerEnabled.value + (label to on)
+    }
+
+    // ---- Network streaming on/off (user preference; independent of sensors + local file) ----
+    // Default ON so streaming "just works" once the PC server + adb reverse are up. Deliberately
+    // NOT reset by clear() — the choice persists across sessions for the life of the process.
+    private val _streamEnabled = MutableStateFlow(true)
+    val streamEnabled: StateFlow<Boolean> = _streamEnabled.asStateFlow()
+    internal fun setStreamEnabled(on: Boolean) { _streamEnabled.value = on }
+
     internal fun setActive(option: SensorOption?) { _active.value = option }
     internal fun publishReadings(map: Map<String, String>) { _readings.value = map }
     internal fun setAutoRun(progress: AutoRunProgress?) { _autoRun.value = progress }
@@ -61,11 +99,15 @@ object TrackingRepository {
     internal fun setAccel(sample: AccelSample) { _accel.value = sample }
     internal fun setHeartRate(sample: HrSample) { _heartRate.value = sample }
     internal fun setEda(sample: EdaSample) { _eda.value = sample }
+    internal fun setPpg(sample: PpgSample) { _ppg.value = sample }
+    internal fun setSkinTemp(sample: SkinTempSample) { _skinTemp.value = sample }
 
     internal fun clearMultiSamples() {
         _accel.value = null
         _heartRate.value = null
         _eda.value = null
+        _ppg.value = null
+        _skinTemp.value = null
     }
 
     internal fun clear() {

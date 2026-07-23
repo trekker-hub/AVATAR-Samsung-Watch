@@ -1,33 +1,26 @@
 package com.example.galaxywatch5.presentation.ui
 
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.BasicText
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.TextStyle
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import androidx.wear.compose.foundation.lazy.ScalingLazyColumn
+import androidx.wear.compose.foundation.lazy.items
+import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
+import androidx.wear.compose.material.Chip
+import androidx.wear.compose.material.CompactChip
+import androidx.wear.compose.material.ListHeader
+import androidx.wear.compose.material.Text
+import com.example.galaxywatch5.presentation.theme.AvatarTokens
+import com.example.galaxywatch5.presentation.theme.AvatarWearScaffold
 import com.example.galaxywatch5.presentation.logging.SessionFile
 import com.example.galaxywatch5.presentation.logging.SessionStore
 import java.text.SimpleDateFormat
@@ -77,70 +70,54 @@ private fun SessionList(
     onClearAll: () -> Unit,
 ) {
     var confirmClear by remember { mutableStateOf(false) }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color.Black)
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 26.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        BasicText(
-            "Sessions (${sessions.size})",
-            style = TextStyle(
-                color = Color(0xFF0FE0B0), fontSize = 14.sp,
-                fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
-            ),
-        )
-        Spacer(Modifier.height(10.dp))
+    val state = rememberScalingLazyListState()
+    AvatarWearScaffold(state) {
+        ScalingLazyColumn(state = state, contentPadding = AvatarTokens.ListContentPadding,
+            modifier = Modifier.fillMaxWidth()) {
+            item { ListHeader { Text("Sessions (${sessions.size})", style = AvatarTokens.Title,
+                textAlign = TextAlign.Center) } }
 
-        if (sessions.isEmpty()) {
-            BasicText(
-                "No log files yet.\nRun a sensor, then Stop/Back to save one.",
-                style = TextStyle(color = Color.Gray, fontSize = 11.sp, textAlign = TextAlign.Center),
-            )
-        } else {
-            sessions.forEach { s ->
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 3.dp)
-                        .clip(RoundedCornerShape(14.dp))
-                        .background(Color(0xFF1E1E1E))
-                        .clickable { onOpen(s) }
-                        .padding(horizontal = 12.dp, vertical = 9.dp),
-                ) {
-                    Column {
-                        BasicText(
-                            s.name,
-                            style = TextStyle(color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold),
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        BasicText(
-                            "${formatSize(s.sizeBytes)} · ${formatTime(s.lastModified)}",
-                            style = TextStyle(color = Color(0xFF888888), fontSize = 9.sp),
-                        )
+            if (sessions.isEmpty()) {
+                item { Text("No log files yet.\nRun a sensor, then Stop to save one.",
+                    style = AvatarTokens.Label, textAlign = TextAlign.Center) }
+            } else {
+                items(sessions) { s ->
+                    Chip(
+                        label = { Text(s.name, style = AvatarTokens.ChipLabel) },
+                        secondaryLabel = {
+                            Text("${formatSize(s.sizeBytes)} · ${formatTime(s.lastModified)}",
+                                style = AvatarTokens.Label)
+                        },
+                        onClick = { onOpen(s) },
+                        colors = AvatarTokens.chipColors(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+                item {
+                    if (!confirmClear) {
+                        Chip(label = { Text("Clear all (${sessions.size})", style = AvatarTokens.ChipLabel) },
+                            onClick = { confirmClear = true }, colors = AvatarTokens.dangerChipColors(),
+                            modifier = Modifier.fillMaxWidth())
+                    } else {
+                        Chip(label = { Text("Tap again to delete all", style = AvatarTokens.ChipLabel) },
+                            onClick = { onClearAll(); confirmClear = false },
+                            colors = AvatarTokens.dangerChipColors(), modifier = Modifier.fillMaxWidth())
+                    }
+                }
+                if (confirmClear) {
+                    item {
+                        CompactChip(label = { Text("Cancel", style = AvatarTokens.ChipLabel) },
+                            onClick = { confirmClear = false }, colors = AvatarTokens.chipColors(),
+                            modifier = Modifier.fillMaxWidth())
                     }
                 }
             }
-        }
-
-        if (sessions.isNotEmpty()) {
-            Spacer(Modifier.height(10.dp))
-            if (!confirmClear) {
-                PillButton("Clear all (${sessions.size})", Color(0xFF3A1212)) { confirmClear = true }
-            } else {
-                PillButton("Tap again to delete all", Color(0xFF7A1212)) {
-                    onClearAll()
-                    confirmClear = false
-                }
-                Spacer(Modifier.height(4.dp))
-                PillButton("Cancel", Color(0xFF2A2440)) { confirmClear = false }
+            item {
+                CompactChip(label = { Text("Back", style = AvatarTokens.ChipLabel) },
+                    onClick = onBack, colors = AvatarTokens.chipColors(active = false),
+                    modifier = Modifier.fillMaxWidth())
             }
         }
-
-        Spacer(Modifier.height(12.dp))
-        PillButton("‹ Back", Color(0xFF2A2440), onBack)
     }
 }
 
@@ -151,56 +128,31 @@ private fun SessionDetail(
     onDelete: () -> Unit,
 ) {
     val result = remember(session) { SessionStore.readLines(session.file) }
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color.Black)
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 14.dp, vertical = 26.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-    ) {
-        BasicText(
-            session.name,
-            style = TextStyle(
-                color = Color(0xFF0FE0B0), fontSize = 12.sp,
-                fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
-            ),
-        )
-        BasicText(
-            "${result.lines.size} lines${if (result.truncated) " (first 400)" else ""}",
-            style = TextStyle(color = Color(0xFF888888), fontSize = 9.sp),
-        )
-        Spacer(Modifier.height(8.dp))
-
-        result.lines.forEach { line ->
-            BasicText(
-                line,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 2.dp),
-                style = TextStyle(color = Color(0xFF33F26B), fontSize = 8.sp),
-            )
+    val state = rememberScalingLazyListState()
+    AvatarWearScaffold(state) {
+        ScalingLazyColumn(state = state, contentPadding = AvatarTokens.ListContentPadding,
+            modifier = Modifier.fillMaxWidth()) {
+            item { ListHeader { Text(session.name, style = AvatarTokens.Title,
+                textAlign = TextAlign.Center) } }
+            item {
+                Text("${result.lines.size} lines${if (result.truncated) " (first 400)" else ""}",
+                    style = AvatarTokens.Label, textAlign = TextAlign.Center)
+            }
+            items(result.lines) { line ->
+                Text(line, style = AvatarTokens.Caption.copy(color = AvatarTokens.Ink),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp))
+            }
+            item {
+                CompactChip(label = { Text("Back to sessions", style = AvatarTokens.ChipLabel) },
+                    onClick = onBack, colors = AvatarTokens.chipColors(active = false),
+                    modifier = Modifier.fillMaxWidth())
+            }
+            item {
+                Chip(label = { Text("Delete this file", style = AvatarTokens.ChipLabel) },
+                    onClick = onDelete, colors = AvatarTokens.dangerChipColors(),
+                    modifier = Modifier.fillMaxWidth())
+            }
         }
-
-        Spacer(Modifier.height(12.dp))
-        PillButton("‹ Sessions", Color(0xFF2A2440), onBack)
-        Spacer(Modifier.height(6.dp))
-        PillButton("Delete this file", Color(0xFF3A1212), onDelete)
-    }
-}
-
-@Composable
-private fun PillButton(label: String, bg: Color, onClick: () -> Unit) {
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(16.dp))
-            .background(bg)
-            .clickable { onClick() }
-            .padding(vertical = 10.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        BasicText(label, style = TextStyle(color = Color.White, fontSize = 12.sp))
     }
 }
 

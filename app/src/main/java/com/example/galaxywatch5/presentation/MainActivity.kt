@@ -46,7 +46,15 @@ import com.example.galaxywatch5.presentation.tracking.SensorCatalog
 import com.example.galaxywatch5.presentation.tracking.SensorOption
 import com.example.galaxywatch5.presentation.tracking.SensorTrackingService
 import com.example.galaxywatch5.presentation.tracking.TrackingRepository
+import com.example.galaxywatch5.presentation.ui.AvatarScreen
+import com.example.galaxywatch5.presentation.ui.DiagnosticScreen
+import com.example.galaxywatch5.presentation.ui.LiveReadingsScreen
 import com.example.galaxywatch5.presentation.ui.LogsScreen
+import com.example.galaxywatch5.presentation.ui.MonitorAllScreenStyled
+import com.example.galaxywatch5.presentation.ui.SensorTestsScreen
+import com.example.galaxywatch5.presentation.ui.SensorToggleScreen
+import com.example.galaxywatch5.presentation.ui.SettingsMenuScreen
+import com.example.galaxywatch5.presentation.ui.StreamingScreen
 import com.samsung.android.service.health.tracking.ConnectionListener
 import com.samsung.android.service.health.tracking.HealthTracker
 import com.samsung.android.service.health.tracking.HealthTrackerException
@@ -61,9 +69,8 @@ class MainActivity : ComponentActivity() {
 
     private var connectionStatus by mutableStateOf("Requesting permissions...")
     private val menu = mutableStateListOf<SensorOption>()
-    // Landing screen is the AVATAR stress gauge; tapping it opens the sensor menu.
-    private var showMenu by mutableStateOf(false)
-    private var showLogs by mutableStateOf(false)
+    // Landing screen is the AVATAR stress gauge; tapping it opens the settings hub. null = gauge.
+    private var secondaryScreen by mutableStateOf<AvatarScreen?>(null)
     private var serviceConnected by mutableStateOf(false)
 
     // ---- Live values for the home gauge (streamed by dedicated continuous trackers) ----
@@ -131,7 +138,7 @@ class MainActivity : ComponentActivity() {
         } catch (e: ActivityNotFoundException) {
             runCatching {
                 startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
-            }
+            }w
         }
     }
 
@@ -293,93 +300,66 @@ class MainActivity : ComponentActivity() {
             onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
         }
 
+        // Hardware / swipe back: pop sub-screen → settings hub → gauge; end an active session.
+        androidx.activity.compose.BackHandler(
+            enabled = monitoringAll || active != null || secondaryScreen != null
+        ) {
+            when {
+                monitoringAll || active != null -> sendTrackingCommand(SensorTrackingService.ACTION_STOP)
+                secondaryScreen == AvatarScreen.Settings -> secondaryScreen = null
+                secondaryScreen != null -> secondaryScreen = AvatarScreen.Settings
+            }
+        }
+
         // Multi-sensor "Monitor All" mode takes over the screen while it runs.
         if (monitoringAll) {
-            MonitorAllScreen()
+            MonitorAllScreenStyled(onStop = { sendTrackingCommand(SensorTrackingService.ACTION_STOP) })
             return
         }
-
-        // Landing on the AVATAR gauge when no sensor is running and the menu isn't open.
-        if (active == null && !showMenu) {
-            HomeGauge()
+        // Single-sensor session: live readings.
+        val current = active
+        if (current != null) {
+            val title = autoRun?.let { "${current.label}  (${it.index + 1}/${it.total})" } ?: current.label
+            val stopLabel = if (autoRun != null) "Cancel auto run" else "Stop"
+            LiveReadingsScreen(title, readings, stopLabel,
+                onStop = { sendTrackingCommand(SensorTrackingService.ACTION_STOP) })
             return
         }
-        // Logs browser (reached from the sensor menu).
-        if (active == null && showLogs) {
-            LogsScreen(onBack = { showLogs = false })
-            return
-        }
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 18.dp, vertical = 28.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            BasicText(
-                "AVATAR — Sensor Test",
-                style = TextStyle(
-                    color = Color(0xFF0FE0B0), fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold, textAlign = TextAlign.Center
-                )
+        // Idle: gauge, or a secondary screen reached from the settings hub.
+        when (secondaryScreen) {
+            null -> HomeGauge()
+            AvatarScreen.Settings -> SettingsMenuScreen(
+                onHome = { secondaryScreen = null },
+                onGo = { secondaryScreen = it },
+                onMonitorAll = { sendTrackingCommand(SensorTrackingService.ACTION_MONITOR_ALL) },
+                onAutoRun = { sendTrackingCommand(SensorTrackingService.ACTION_AUTO_RUN) },
             )
-            Spacer(Modifier.height(4.dp))
-
-            val current = active
-            val inAuto = autoRun != null
-            if (current == null) {
-                // -------- Menu --------
-                BasicText(
-                    statusMessage ?: connectionStatus,
-                    style = TextStyle(color = Color.White, fontSize = 11.sp,
-                        textAlign = TextAlign.Center)
-                )
-                Spacer(Modifier.height(10.dp))
-                MenuButton("‹ Home (gauge)", Color(0xFF2A2440)) { showMenu = false }
-                Spacer(Modifier.height(6.dp))
-                MenuButton("🗎 Logs / Sessions", Color(0xFF23303A)) { showLogs = true }
-                Spacer(Modifier.height(6.dp))
-                MenuButton("▶ Auto Run All", Color(0xFF1A3A28)) {
-                    sendTrackingCommand(SensorTrackingService.ACTION_AUTO_RUN)
-                }
-                Spacer(Modifier.height(6.dp))
-                MenuButton("📡 Monitor All (5 signals)", Color(0xFF243A1A)) {
-                    sendTrackingCommand(SensorTrackingService.ACTION_MONITOR_ALL)
-                }
-                Spacer(Modifier.height(6.dp))
-                menu.forEach { option ->
-                    MenuButton(option.label, Color(0xFF1E1E1E)) {
-                        sendTrackingCommand(SensorTrackingService.ACTION_START_SENSOR, option.id)
-                    }
-                }
-                if (menu.isEmpty() && connectionStatus.startsWith("Connected")) {
-                    BasicText("No supported sensors found",
-                        style = TextStyle(color = Color.Gray, fontSize = 10.sp))
-                }
-            } else {
-                // -------- Live readings --------
-                val title = autoRun?.let { "${current.label}  (${it.index + 1}/${it.total})" }
-                    ?: current.label
-                BasicText(
-                    title,
-                    style = TextStyle(color = Color.White, fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
-                )
-                Spacer(Modifier.height(8.dp))
-                readings.entries.sortedBy { it.key }.forEach { (name, value) ->
-                    BasicText(name, style = TextStyle(color = Color(0xFF888888),
-                        fontSize = 10.sp, textAlign = TextAlign.Center))
-                    BasicText(value, style = TextStyle(color = Color(0xFF33F26B),
-                        fontSize = 12.sp, textAlign = TextAlign.Center))
-                    Spacer(Modifier.height(6.dp))
-                }
-                Spacer(Modifier.height(10.dp))
-                val stopLabel = if (inAuto) "Cancel Auto Run" else "Stop / Back"
-                MenuButton(stopLabel, Color(0xFF3A1212)) {
-                    sendTrackingCommand(SensorTrackingService.ACTION_STOP)
-                }
-            }
+            AvatarScreen.Toggles -> SensorToggleScreen(
+                onToggle = { key, on ->
+                    val intent = Intent(this, SensorTrackingService::class.java)
+                        .setAction(SensorTrackingService.ACTION_SET_TRACKER)
+                        .putExtra(SensorTrackingService.EXTRA_TRACKER_LABEL, key)
+                        .putExtra(SensorTrackingService.EXTRA_TRACKER_ON, on)
+                    startForegroundService(intent)
+                },
+                onBack = { secondaryScreen = AvatarScreen.Settings },
+            )
+            AvatarScreen.Diagnostic -> DiagnosticScreen(onBack = { secondaryScreen = AvatarScreen.Settings })
+            AvatarScreen.Streaming -> StreamingScreen(
+                onToggle = { on ->
+                    sendTrackingCommand(
+                        if (on) SensorTrackingService.ACTION_STREAM_ON
+                        else SensorTrackingService.ACTION_STREAM_OFF
+                    )
+                },
+                onBack = { secondaryScreen = AvatarScreen.Settings },
+            )
+            AvatarScreen.SensorTests -> SensorTestsScreen(
+                options = menu.toList(),
+                onStart = { id -> sendTrackingCommand(SensorTrackingService.ACTION_START_SENSOR, id) },
+                onBack = { secondaryScreen = AvatarScreen.Settings },
+            )
+            AvatarScreen.Logs -> LogsScreen(onBack = { secondaryScreen = AvatarScreen.Settings })
         }
     }
 
@@ -399,11 +379,11 @@ class MainActivity : ComponentActivity() {
         val hr = liveHr ?: 72
         val eda = liveEda ?: 2.1f
         val score = remember(hr, eda) { deriveStressPlaceholder(hr, eda) }
-        // Whole face is tappable to open the sensor menu (no on-screen label needed).
+        // Whole face is tappable to open the settings hub (no on-screen label needed).
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .clickable { showMenu = true }
+                .clickable { secondaryScreen = AvatarScreen.Settings }
         ) {
             StressGaugeRing(
                 stressScore = score,
@@ -427,73 +407,4 @@ class MainActivity : ComponentActivity() {
         return ((hrPart + edaPart) / 2f).toInt().coerceIn(5, 95)
     }
 
-    /**
-     * Live view for the multi-sensor "Monitor All" mode. Collects each sensor's flow locally so
-     * high-rate updates (accelerometer) only recompose this leaf, not the whole Screen().
-     */
-    @androidx.compose.runtime.Composable
-    private fun MonitorAllScreen() {
-        val accel by TrackingRepository.accel.collectAsState()
-        val hr by TrackingRepository.heartRate.collectAsState()
-        val eda by TrackingRepository.eda.collectAsState()
-
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(Color.Black)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 18.dp, vertical = 28.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            BasicText(
-                "AVATAR — Monitor All",
-                style = TextStyle(
-                    color = Color(0xFF0FE0B0), fontSize = 14.sp,
-                    fontWeight = FontWeight.Bold, textAlign = TextAlign.Center
-                )
-            )
-            Spacer(Modifier.height(10.dp))
-
-            SignalRow("Accelerometer", accel?.let { "x=${it.x}  y=${it.y}  z=${it.z}" })
-            SignalRow("Heart rate", hr?.let { "${it.hr} bpm  (st ${it.status})" })
-            SignalRow("IBI", hr?.let { if (it.ibi.isEmpty()) "— (none this packet)" else "${it.ibi.size}: ${it.ibi.joinToString()}" })
-            SignalRow("EDA", eda?.let { "${it.skinConductance} µS  (st ${it.status})" })
-
-            Spacer(Modifier.height(12.dp))
-            MenuButton("Stop", Color(0xFF3A1212)) {
-                sendTrackingCommand(SensorTrackingService.ACTION_STOP)
-            }
-        }
-    }
-
-    /** One label/value pair on the Monitor-All screen; shows "waiting…" until the first packet. */
-    @androidx.compose.runtime.Composable
-    private fun SignalRow(label: String, value: String?) {
-        BasicText(label, style = TextStyle(color = Color(0xFF888888),
-            fontSize = 10.sp, textAlign = TextAlign.Center))
-        BasicText(
-            value ?: "waiting…",
-            style = TextStyle(
-                color = if (value != null) Color(0xFF33F26B) else Color(0xFF666666),
-                fontSize = 12.sp, textAlign = TextAlign.Center
-            )
-        )
-        Spacer(Modifier.height(6.dp))
-    }
-
-    @androidx.compose.runtime.Composable
-    private fun MenuButton(label: String, bg: Color, onClick: () -> Unit) {
-        Box(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 3.dp)
-                .clip(RoundedCornerShape(16.dp))
-                .background(bg)
-                .clickable { onClick() }
-                .padding(vertical = 10.dp),
-            contentAlignment = Alignment.Center
-        ) {
-            BasicText(label, style = TextStyle(color = Color.White, fontSize = 12.sp))
-        }
-    }
 }
